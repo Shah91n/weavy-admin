@@ -8,7 +8,7 @@ ProfilingAnalysisWorker   – Claude AI analysis of a goroutine dump.
 Capture order:
   1. Instant profiles (heap, allocs, mutex, goroutine) — sequential.
   2. Goroutine text dump.
-  3. CPU + fgprof — launched concurrently, both waited on.
+  3. CPU + fgprof — captured one after the other.
   4. SVG flame-graphs for all captured .pb.gz files.
 
 SVG generation uses ``go tool pprof -svg``.  If ``go`` is not found, a
@@ -115,7 +115,7 @@ class ProfilingCaptureWorker(QThread):
     Capture order (mirrors the reference bash script):
       1. Instant profiles (heap, allocs, mutex, goroutine) — sequential.
       2. Goroutine text dump (``?debug=2``).
-      3. CPU + fgprof — launched concurrently, waited on together.
+      3. CPU + fgprof — captured one after the other.
       4. SVG flame-graphs for all captured ``.pb.gz`` files.
 
     If ``go`` is not found, an SVG warning is emitted once (not per profile).
@@ -186,18 +186,16 @@ class ProfilingCaptureWorker(QThread):
             if ProfilingBridge.capture_goroutine_text_dump(dump_path):
                 results["goroutine_dump"] = dump_path
 
-            # ── Step 3: cpu + fgprof concurrently ──────────────────────────
+            # ── Step 3: cpu, then fgprof (never at the same time) ──────────
             timed = [p for p in self.profiles if p in _TIMED_PROFILES]
             if timed:
-                self.progress.emit(
-                    f"Capturing cpu + fgprof concurrently (duration: {self.duration}s)…"
-                )
+                self.progress.emit(f"Capturing cpu, then fgprof (duration: {self.duration}s each)…")
                 for name in timed:
                     self.profile_started.emit(name)
-                concurrent_results = ProfilingBridge.capture_timed_profiles_concurrent(
+                timed_results = ProfilingBridge.capture_timed_profiles_sequential(
                     self.duration, self.save_dir
                 )
-                for name, (ok, pb_path) in concurrent_results.items():
+                for name, (ok, pb_path) in timed_results.items():
                     if name not in timed:
                         continue
                     if ok:

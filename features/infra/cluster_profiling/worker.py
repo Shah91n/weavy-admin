@@ -7,7 +7,7 @@ conflicts on 6060.
 Capture order per pod:
   1. Instant profiles (heap, allocs, mutex, goroutine) — sequential.
   2. Goroutine text dump (``?debug=2``).
-  3. CPU + fgprof — launched concurrently, waited on together.
+  3. CPU + fgprof — captured one after the other.
   4. SVG flame-graphs for all captured ``.pb.gz`` files.
 """
 
@@ -181,17 +181,15 @@ class ClusterProfilingWorker(QThread):
                 else:
                     self._log("    ✗ goroutine_dump.txt  failed")
 
-            # ── Step 3: cpu + fgprof concurrently ──────────────────────────
+            # ── Step 3: cpu, then fgprof (never at the same time) ──────────
             timed = [p for p in self.profiles if p in ("cpu", "fgprof")]
             if timed and not self._cancelled:
-                self._log(
-                    f"  → 3. Downloading CPU and fgprof concurrently (duration: {self.duration}s)…"
-                )
-                self.pod_progress.emit(pod_name, f"cpu + fgprof ({self.duration}s)…")
-                concurrent_results = ProfilingBridge.capture_timed_profiles_concurrent(
+                self._log(f"  → 3. Downloading CPU, then fgprof (duration: {self.duration}s each)…")
+                self.pod_progress.emit(pod_name, f"cpu → fgprof ({self.duration}s each)…")
+                timed_results = ProfilingBridge.capture_timed_profiles_sequential(
                     self.duration, pod_dir
                 )
-                for name, (ok, pb_path) in concurrent_results.items():
+                for name, (ok, pb_path) in timed_results.items():
                     if name not in timed:
                         continue
                     if ok:
