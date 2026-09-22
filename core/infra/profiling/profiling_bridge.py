@@ -9,7 +9,7 @@ Responsibilities
 - Start / stop ``kubectl port-forward`` for a pod on port 6060.
 - Curl pprof endpoints and save ``.pb.gz`` files.
 - Fetch the goroutine text dump (``?debug=2``).
-- Run cpu and fgprof concurrently (both block for ``duration`` seconds).
+- Run cpu and fgprof one after the other (each blocks for ``duration`` seconds).
 - Generate SVG flame-graphs via ``go tool pprof -svg``.
 
 All CLI calls use ``subprocess.run`` / ``subprocess.Popen`` — no Python SDK
@@ -193,22 +193,27 @@ class ProfilingBridge:
             return False
 
     # ------------------------------------------------------------------
-    # Concurrent timed capture (cpu + fgprof)
+    # Sequential timed capture (cpu, then fgprof)
     # ------------------------------------------------------------------
 
     @staticmethod
-    def capture_timed_profiles_concurrent(
+    def capture_timed_profiles_sequential(
         duration: int,
         output_dir: str,
     ) -> dict[str, tuple[bool, str]]:
         """
-        Capture ``cpu`` and ``fgprof`` concurrently — both curl calls run in
-        the background and the method blocks until both finish (or time out).
+        Capture ``cpu`` and ``fgprof`` one after the other — never at the same
+        time.
+
+        When both profilers run concurrently each one shows up in the other's
+        profile, which makes them harder to read.  ``cpu`` is captured first,
+        then ``fgprof``, so each covers its own clean window.  The method
+        therefore blocks for roughly ``2 * duration`` seconds.
 
         Parameters
         ----------
         duration:
-            Sampling duration in seconds.
+            Sampling duration in seconds, per profile.
         output_dir:
             Directory where ``.pb.gz`` files are written.
 
@@ -218,48 +223,13 @@ class ProfilingBridge:
             ``{profile_name: (success, file_path)}`` for ``"cpu"`` and
             ``"fgprof"``.
         """
-        timeout = duration + _CURL_OVERHEAD
-        procs: dict[str, subprocess.Popen] = {}
-        files: dict[str, str] = {}
+        results: dict[str, tuple[bool, str]] = {}
 
         for name in ("cpu", "fgprof"):
-            endpoint = _ENDPOINTS[name].format(duration=duration)
-            url = _BASE_URL + endpoint
             output_path = os.path.join(output_dir, f"{name}.pb.gz")
-            files[name] = output_path
-            cmd = ["curl", "-s", "--max-time", str(timeout), "-o", output_path, url]
-            logger.debug("Concurrent capture start: %s", " ".join(cmd))
-            try:
-                procs[name] = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except FileNotFoundError:
-                logger.error("curl not found")
-                procs[name] = None  # type: ignore[assignment]
-
-        results: dict[str, tuple[bool, str]] = {}
-        for name, proc in procs.items():
-            output_path = files[name]
-            if proc is None:
-                results[name] = (False, output_path)
-                continue
-            try:
-                proc.wait(timeout=timeout + 5)
-                ok = (
-                    proc.returncode == 0
-                    and os.path.exists(output_path)
-                    and os.path.getsize(output_path) > 0
-                )
-                results[name] = (ok, output_path)
-            except subprocess.TimeoutExpired:
-                logger.warning("Timeout waiting for concurrent %s capture", name)
-                proc.kill()
-                results[name] = (False, output_path)
-            except Exception as exc:
-                logger.warning("Error waiting for %s: %s", name, exc)
-                results[name] = (False, output_path)
+            logger.debug("Sequential capture start: %s (%ds)", name, duration)
+            ok = ProfilingBridge.capture_profile(name, duration, output_path)
+            results[name] = (ok, output_path)
 
         return results
 
