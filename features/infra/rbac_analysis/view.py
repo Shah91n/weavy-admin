@@ -44,7 +44,8 @@ from PyQt6.QtWidgets import (
 )
 
 from app.state import AppState
-from features.infra.rbac_log.worker import RBACLogWorker
+from features.infra.rbac_analysis.worker import RBACAnalysisWorker
+from shared.loading_bar import LoadingBar
 from shared.styles.infra_qss import (
     COLOR_LEVEL_INFO_TEXT,
     COLOR_LEVEL_PANIC_ERROR_TEXT,
@@ -87,7 +88,7 @@ class RBACAnalysisView(QWidget, WorkerMixin):
         _state = AppState.instance()
         self._namespace = namespace or _state.namespace
         self._all_entries: list[dict] = []
-        self._worker: RBACLogWorker | None = None
+        self._worker: RBACAnalysisWorker | None = None
         self._alive: bool = True
         self.setStyleSheet(INFRA_STYLESHEET)
         self._build_ui()
@@ -121,10 +122,10 @@ class RBACAnalysisView(QWidget, WorkerMixin):
         if self._worker is not None:
             self._detach_worker()
 
-        self._refresh_btn.setEnabled(False)
+        self._set_busy(True)
         self._status_label.setText(f"Fetching RBAC logs from '{self._namespace}' …")
 
-        self._worker = RBACLogWorker(self._namespace)
+        self._worker = RBACAnalysisWorker(self._namespace)
         self._worker.logs_ready.connect(self._on_logs_ready)
         self._worker.progress.connect(self._on_progress)
         self._worker.error.connect(self._on_error)
@@ -139,6 +140,8 @@ class RBACAnalysisView(QWidget, WorkerMixin):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self._build_toolbar())
+        self._loading_bar = LoadingBar()
+        layout.addWidget(self._loading_bar)
 
         scroll = QScrollArea()
         scroll.setObjectName("rbacScrollArea")
@@ -228,13 +231,17 @@ class RBACAnalysisView(QWidget, WorkerMixin):
         except RuntimeError:
             self._alive = False
 
+    def _set_busy(self, busy: bool) -> None:
+        self._loading_bar.set_busy(busy)
+        self._refresh_btn.setEnabled(not busy)
+
     def _on_error(self, msg: str) -> None:
         self._detach_worker()
         if not self._alive:
             return
         try:
             self._status_label.setText(f"Error: {msg}")
-            self._refresh_btn.setEnabled(True)
+            self._set_busy(False)
             logger.error("RBACAnalysisView worker error: %s", msg)
         except RuntimeError:
             self._alive = False
@@ -247,7 +254,7 @@ class RBACAnalysisView(QWidget, WorkerMixin):
             self._all_entries = entries
             self._rebuild_analysis()
             self._status_label.setText(f"Analysis based on {len(entries):,} RBAC entries.")
-            self._refresh_btn.setEnabled(True)
+            self._set_busy(False)
         except RuntimeError:
             self._alive = False
 

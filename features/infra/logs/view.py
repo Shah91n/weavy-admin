@@ -16,7 +16,7 @@ import json
 import logging
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFontDatabase
+from PyQt6.QtGui import QBrush, QColor, QFontDatabase
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -27,6 +27,8 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QSpinBox,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -36,16 +38,65 @@ from PyQt6.QtWidgets import (
 
 from app.state import AppState
 from features.infra.logs.worker import LogWorker
-from shared.styles.infra_qss import INFRA_STYLESHEET
+from shared.detail_pane import RowDetailPane, build_detail_fields
+from shared.loading_bar import LoadingBar
+from shared.styles.infra_qss import (
+    COLOR_LEVEL_DEBUG_TEXT,
+    COLOR_LEVEL_INFO_TEXT,
+    COLOR_LEVEL_PANIC_ERROR_TEXT,
+    COLOR_LEVEL_TRACE_TEXT,
+    COLOR_LEVEL_WARNING_TEXT,
+    INFRA_STYLESHEET,
+    INFRA_TEXT_PRIMARY,
+)
 from shared.worker_mixin import WorkerMixin
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Time window options
+# ---------------------------------------------------------------------------
+# Each tuple: (display label, value passed to ``kubectl logs --since``).
+# kubectl takes Go durations, which have no "d" unit — days are written in hours.
+
+_TIME_WINDOWS: list[tuple[str, str]] = [
+    ("Last 15 minutes", "15m"),
+    ("Last 1 hour", "1h"),
+    ("Last 6 hours", "6h"),
+    ("Last 12 hours", "12h"),
+    ("Last 24 hours", "24h"),
+    ("Last 3 days", "72h"),
+    ("Last 7 days", "168h"),
+]
+_DEFAULT_TIME_WINDOW = 1  # "Last 1 hour"
+
+# Max lines fetched per pod (``kubectl logs --tail``). Fetching is cheap; the cost
+# is building the table on the UI thread afterwards, which grows with row count.
+_TAIL_DEFAULT = 5000
+_TAIL_MIN = 100
+_TAIL_MAX = 100_000
+_TAIL_STEP = 1000
+_TAIL_SLOW_THRESHOLD = 20_000  # above this per pod, warn that it will take a while
 
 # ---------------------------------------------------------------------------
 # Column definitions
 # ---------------------------------------------------------------------------
 
 COLUMNS = ["Timestamp", "Level", "Action", "Message", "User", "Request", "Method", "Pod"]
+
+# Level → row text colour. Only the foreground is honoured: a QSS background on
+# QTableWidget overrides QTableWidgetItem.setBackground(), so a background map
+# here would silently render nothing.
+_LEVEL_FG: dict[str, str] = {
+    "PANIC": COLOR_LEVEL_PANIC_ERROR_TEXT,
+    "FATAL": COLOR_LEVEL_PANIC_ERROR_TEXT,
+    "ERROR": COLOR_LEVEL_PANIC_ERROR_TEXT,
+    "WARNING": COLOR_LEVEL_WARNING_TEXT,
+    "WARN": COLOR_LEVEL_WARNING_TEXT,
+    "INFO": COLOR_LEVEL_INFO_TEXT,
+    "DEBUG": COLOR_LEVEL_DEBUG_TEXT,
+    "TRACE": COLOR_LEVEL_TRACE_TEXT,
+}
 COL_TIMESTAMP = 0
 COL_LEVEL = 1
 COL_ACTION = 2
@@ -152,11 +203,17 @@ class LogView(QWidget, WorkerMixin):
         if self._worker is not None:
             self._detach_worker()
 
+        label, since = _TIME_WINDOWS[self._time_combo.currentIndex()]
+        tail = self._tail_spin.value()
+        slow_hint = " — large limit, this may take a while" if tail > _TAIL_SLOW_THRESHOLD else ""
+
         self._set_controls_enabled(False)
-        self._update_status(f"Fetching logs from namespace '{self._namespace}' …")
+        self._update_status(
+            f"Fetching up to {tail:,} lines/pod ({label}) from '{self._namespace}'{slow_hint} …"
+        )
         self._table.setRowCount(0)
 
-        self._worker = LogWorker(self._namespace)
+        self._worker = LogWorker(self._namespace, tail=tail, since=since)
         self._worker.logs_ready.connect(self._on_logs_ready)
         self._worker.progress.connect(self._update_status)
         self._worker.error.connect(self._on_error)
@@ -172,7 +229,21 @@ class LogView(QWidget, WorkerMixin):
         layout.setSpacing(0)
 
         layout.addWidget(self._build_toolbar())
-        layout.addWidget(self._build_table())
+        self._loading_bar = LoadingBar()
+        layout.addWidget(self._loading_bar)
+
+        # Table over an expandable detail pane — selecting a row shows every
+        # field in full, so long paths / messages no longer need a modal.
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.setObjectName("detailSplitter")
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._build_table())
+        self._detail_pane = RowDetailPane()
+        splitter.addWidget(self._detail_pane)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([460, 240])  # px: table keeps roughly two thirds
+        layout.addWidget(splitter, 1)
 
     def _build_toolbar(self) -> QWidget:
         toolbar = QWidget()
@@ -181,9 +252,44 @@ class LogView(QWidget, WorkerMixin):
         row.setContentsMargins(8, 6, 8, 6)
         row.setSpacing(8)
 
+        # Time window selector
+        time_label = QLabel("Time window:")
+        time_label.setObjectName("infraStatusLabel")
+        row.addWidget(time_label)
+
+        self._time_combo = QComboBox()
+        self._time_combo.setObjectName("infraFilterCombo")
+        for display, _ in _TIME_WINDOWS:
+            self._time_combo.addItem(display)
+        self._time_combo.setCurrentIndex(_DEFAULT_TIME_WINDOW)
+        self._time_combo.setToolTip(
+            "How far back to fetch logs.\n"
+            "Only covers the current container — lines from before a pod restart are gone."
+        )
+        row.addWidget(self._time_combo)
+
+        # Per-pod line limit — always set (a spin box cannot be empty)
+        tail_label = QLabel("Lines/pod:")
+        tail_label.setObjectName("infraStatusLabel")
+        row.addWidget(tail_label)
+
+        self._tail_spin = QSpinBox()
+        self._tail_spin.setRange(_TAIL_MIN, _TAIL_MAX)
+        self._tail_spin.setSingleStep(_TAIL_STEP)
+        self._tail_spin.setValue(_TAIL_DEFAULT)
+        self._tail_spin.setGroupSeparatorShown(True)
+        self._tail_spin.setToolTip(
+            "Maximum lines fetched from each pod — the newest ones within the time window.\n"
+            f"Higher limits show more history but take longer to load and filter\n"
+            f"(above {_TAIL_SLOW_THRESHOLD:,} per pod expect a noticeable wait)."
+        )
+        row.addWidget(self._tail_spin)
+
         # Get Logs button
         self._get_logs_btn = QPushButton("Get Logs")
-        self._get_logs_btn.setToolTip("Fetch latest log lines from each pod (up to 5,000 total)")
+        self._get_logs_btn.setToolTip(
+            "Fetch log lines from each pod for the selected time window and line limit."
+        )
         self._get_logs_btn.clicked.connect(self.get_logs)
         row.addWidget(self._get_logs_btn)
 
@@ -290,6 +396,7 @@ class LogView(QWidget, WorkerMixin):
         self._table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
 
         self._table.cellDoubleClicked.connect(self._on_row_double_clicked)
+        self._table.itemSelectionChanged.connect(self._on_row_selected)
         return self._table
 
     # ------------------------------------------------------------------
@@ -318,6 +425,17 @@ class LogView(QWidget, WorkerMixin):
             logger.error("LogWorker error: %s", msg)
         except RuntimeError:
             self._alive = False
+
+    def _on_row_selected(self) -> None:
+        """Fill the detail pane from the selected row."""
+        if not self._alive:
+            return
+        rows = {idx.row() for idx in self._table.selectedIndexes()}
+        if not rows:
+            self._detail_pane.clear_entry()
+            return
+        fields, raw = build_detail_fields(self._table, min(rows), COLUMNS, COL_TIMESTAMP)
+        self._detail_pane.show_entry(fields, raw)
 
     def _on_row_double_clicked(self, row: int, _col: int) -> None:
         # Retrieve raw JSON stored in the hidden user-data of the first cell
@@ -375,9 +493,12 @@ class LogView(QWidget, WorkerMixin):
                     entry.get("pod", ""),
                 ]
 
+                fg = QBrush(QColor(_LEVEL_FG.get(level, INFRA_TEXT_PRIMARY)))
+
                 for col, text in enumerate(cells):
                     item = QTableWidgetItem(str(text))
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    item.setForeground(fg)
 
                     if col == COL_TIMESTAMP:
                         item.setData(Qt.ItemDataRole.UserRole, entry.get("raw", ""))
@@ -445,6 +566,9 @@ class LogView(QWidget, WorkerMixin):
         self._status_label.setText(msg)
 
     def _set_controls_enabled(self, enabled: bool) -> None:
+        self._loading_bar.set_busy(not enabled)
+        self._time_combo.setEnabled(enabled)
+        self._tail_spin.setEnabled(enabled)
         self._get_logs_btn.setEnabled(enabled)
         self._search_bar.setEnabled(enabled)
         self._level_combo.setEnabled(enabled)

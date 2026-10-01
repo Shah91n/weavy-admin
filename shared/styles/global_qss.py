@@ -379,11 +379,12 @@ QTableWidget {{
     border: 1px solid {COLOR_BORDER};
 }}
 
+/* No background-color / color here on purpose: a stylesheet rule on ::item
+   overrides QTableWidgetItem.setForeground(), silently killing every semantic
+   row colour in the app. The QTableWidget rule above already supplies both. */
 QTableWidget::item {{
     padding: 4px;
     border: none;
-    background-color: {COLOR_SECONDARY_BG};
-    color: {COLOR_TEXT_PRIMARY};
 }}
 
 QTableWidget::item:selected {{
@@ -745,6 +746,18 @@ QLabel#choiceCardDesc {{
 # ---------------------------------------------------------------------------
 
 _QSS_REUSABLE = f"""
+/* shared/loading_bar.py — thin busy strip under a toolbar while a worker runs. */
+QProgressBar#loadingBar {{
+    max-height: 3px;
+    min-height: 3px;
+    border: none;
+    background-color: {COLOR_SECONDARY_BG};
+}}
+
+QProgressBar#loadingBar::chunk {{
+    background-color: {COLOR_ACCENT_GREEN};
+}}
+
 QLabel#sectionHeader {{
     font-size: 16px;
     font-weight: bold;

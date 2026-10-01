@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -30,9 +31,10 @@ from PyQt6.QtWidgets import (
 
 from app.state import AppState
 from features.infra.rbac_log.worker import RBACLogWorker
+from shared.detail_pane import RowDetailPane, build_detail_fields
+from shared.loading_bar import LoadingBar
 from shared.styles.infra_qss import (
     COLOR_LEVEL_INFO_TEXT,
-    COLOR_LEVEL_PANIC_ERROR_BG,
     COLOR_LEVEL_PANIC_ERROR_TEXT,
     COLOR_LEVEL_WARNING_TEXT,
     INFRA_STYLESHEET,
@@ -55,12 +57,6 @@ COL_REQ_ACTION = 4
 COL_RESOURCE = 5
 COL_RESULT = 6
 COL_POD = 7
-
-_LEVEL_BG: dict[str, str] = {
-    "PANIC": COLOR_LEVEL_PANIC_ERROR_BG,
-    "FATAL": COLOR_LEVEL_PANIC_ERROR_BG,
-    "ERROR": COLOR_LEVEL_PANIC_ERROR_BG,
-}
 
 _LEVEL_FG: dict[str, str] = {
     "PANIC": COLOR_LEVEL_PANIC_ERROR_TEXT,
@@ -162,7 +158,21 @@ class RBACLogView(QWidget, WorkerMixin):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self._build_toolbar())
-        layout.addWidget(self._build_table())
+        self._loading_bar = LoadingBar()
+        layout.addWidget(self._loading_bar)
+
+        # Table over an expandable detail pane — selecting a row shows every
+        # field in full, so long resources / messages no longer need a modal.
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.setObjectName("detailSplitter")
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._build_table())
+        self._detail_pane = RowDetailPane()
+        splitter.addWidget(self._detail_pane)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([460, 240])  # px: table keeps roughly two thirds
+        layout.addWidget(splitter, 1)
 
     def _build_toolbar(self) -> QWidget:
         toolbar = QWidget()
@@ -246,7 +256,19 @@ class RBACLogView(QWidget, WorkerMixin):
         for col, w in widths.items():
             self._table.setColumnWidth(col, w)
 
+        self._table.itemSelectionChanged.connect(self._on_row_selected)
         return self._table
+
+    def _on_row_selected(self) -> None:
+        """Fill the detail pane from the selected row."""
+        if not self._alive:
+            return
+        rows = {idx.row() for idx in self._table.selectedIndexes()}
+        if not rows:
+            self._detail_pane.clear_entry()
+            return
+        fields, raw = build_detail_fields(self._table, min(rows), COLUMNS, COL_TIMESTAMP)
+        self._detail_pane.show_entry(fields, raw)
 
     # ------------------------------------------------------------------
     # Slots
@@ -306,11 +328,7 @@ class RBACLogView(QWidget, WorkerMixin):
 
             for row, entry in enumerate(entries):
                 level = entry.get("level", "").upper()
-                bg_hex = _LEVEL_BG.get(level)
-                fg_hex = _LEVEL_FG.get(level, INFRA_TEXT_PRIMARY)
-
-                bg = QBrush(QColor(bg_hex)) if bg_hex else None
-                fg = QBrush(QColor(fg_hex))
+                fg = QBrush(QColor(_LEVEL_FG.get(level, INFRA_TEXT_PRIMARY)))
 
                 req_action = entry.get("request_action", "")
                 result = entry.get("result", "")
@@ -333,8 +351,6 @@ class RBACLogView(QWidget, WorkerMixin):
                     if col == COL_TIMESTAMP:
                         item.setData(Qt.ItemDataRole.UserRole, entry.get("raw", ""))
 
-                    if bg:
-                        item.setBackground(bg)
                     item.setForeground(fg)
 
                     if col == COL_RESULT and text in _RESULT_FG:
@@ -381,6 +397,7 @@ class RBACLogView(QWidget, WorkerMixin):
         self._status_label.setText(msg)
 
     def _set_controls_enabled(self, enabled: bool) -> None:
+        self._loading_bar.set_busy(not enabled)
         self._get_logs_btn.setEnabled(enabled)
         self._search_bar.setEnabled(enabled)
         self._level_combo.setEnabled(enabled)

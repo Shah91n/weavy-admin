@@ -25,6 +25,7 @@ _DETACH_SIGNALS: tuple[str, ...] = (
     # Pod workers
     "pods_ready",
     "pod_ready",
+    "comparison_ready",
     # Log / RBAC workers
     "logs_ready",
     # LB traffic worker

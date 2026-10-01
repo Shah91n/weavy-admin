@@ -45,9 +45,9 @@ features/                        One package per feature — view + worker, full
     cluster_profiling/           Batch pprof capture across all pods
     lb_traffic/                  GCP + AWS load balancer traffic views and workers
     logs/                        Kubernetes log explorer
-    pods/                        Pod list + pod detail views and worker
+    pods/                        Pod list + cross-pod comparison, pod detail view, workers
     profiling/                   Single-pod pprof profiling view and workers
-    rbac_analysis/               RBAC log analysis view
+    rbac_analysis/               RBAC log analysis view + worker
     rbac_log/                    RBAC audit log explorer + worker
     statefulset/                 StatefulSet overview + worker
 
@@ -66,11 +66,15 @@ core/                            Pure Python — ZERO Qt imports — testable in
     gcp/                         GCP cluster bridge + LB traffic reader
     aws/                         AWS cluster bridge + LB traffic reader
     profiling/                   pprof bridge, profile parser, Claude analyzer
+    logs/                        kubectl pod-log fetch + parse, RBAC entry filter
+    pods/                        Pod manifests + events, live usage, cross-pod comparison
     lb_traffic_utils.py          Shared latency parsing utility
 
 shared/
   base_worker.py                 QThread base with finished / error / progress signals
   worker_mixin.py                Signal connection/disconnection helpers
+  detail_pane.py                 RowDetailPane — expandable full-row detail under log tables
+  loading_bar.py                 LoadingBar — thin indeterminate strip shown while a worker runs
   request_logger.py              HTTP request interceptor (Qt-aware)
   models/
     dynamic_weaviate_model.py    QAbstractTableModel for Weaviate object data

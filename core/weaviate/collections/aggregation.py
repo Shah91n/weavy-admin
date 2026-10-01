@@ -12,7 +12,9 @@ def aggregate_collections() -> dict:
     try:
         manager = get_weaviate_manager()
         client = manager.client
-        collections = client.collections.list_all()
+        # One /v1/schema call — simple=False carries each collection's MT flag,
+        # so no per-collection config.get() is needed.
+        collections = client.collections.list_all(simple=False)
 
         if not collections:
             return _empty_aggregation_result()
@@ -27,19 +29,17 @@ def aggregate_collections() -> dict:
         empty_tenants_details = []
         rows = []
 
-        for collection_name in collections:
+        for collection_name, cfg in collections.items():
             try:
                 collection = client.collections.use(collection_name)
 
-                is_multi_tenant = False
+                is_multi_tenant = _is_multi_tenant(cfg)
                 tenants = {}
-                try:
-                    config = collection.config.get()
-                    is_multi_tenant = config.multi_tenancy_config.enabled
-                    if is_multi_tenant:
+                if is_multi_tenant:
+                    try:
                         tenants = collection.tenants.get() or {}
-                except Exception:
-                    logger.warning("aggregation: MT config fetch failed", exc_info=True)
+                    except Exception:
+                        logger.warning("aggregation: tenant fetch failed", exc_info=True)
 
                 if is_multi_tenant:
                     rows.append(
@@ -161,6 +161,12 @@ def aggregate_collections() -> dict:
         return {"error": str(e)}
 
 
+def _is_multi_tenant(cfg: object) -> bool:
+    """MT flag from a full ``list_all(simple=False)`` config entry."""
+    mt_cfg = getattr(cfg, "multi_tenancy_config", None)
+    return bool(getattr(mt_cfg, "enabled", False))
+
+
 def list_collections_with_mt_status() -> list[dict]:
     """Return all collections with their multi-tenancy flag.
 
@@ -172,8 +178,7 @@ def list_collections_with_mt_status() -> list[dict]:
     collections = client.collections.list_all(simple=False) or {}
     result: list[dict] = []
     for name, cfg in collections.items():
-        mt_cfg = getattr(cfg, "multi_tenancy_config", None)
-        result.append({"name": name, "multi_tenant": bool(getattr(mt_cfg, "enabled", False))})
+        result.append({"name": name, "multi_tenant": _is_multi_tenant(cfg)})
     result.sort(key=lambda item: item["name"].lower())
     return result
 
@@ -203,25 +208,16 @@ def get_total_objects_combined() -> dict:
     try:
         manager = get_weaviate_manager()
         client = manager.client
-        collections = client.collections.list_all() or []
+        # One /v1/schema call — simple=False carries each collection's MT flag.
+        collections = client.collections.list_all(simple=False) or {}
 
         total = 0
         errors = 0
 
-        for collection_name in collections:
+        for collection_name, cfg in collections.items():
             try:
                 collection = client.collections.use(collection_name)
-                is_multi_tenant = False
-                try:
-                    is_multi_tenant = collection.config.get().multi_tenancy_config.enabled
-                except Exception:
-                    logger.warning(
-                        "total_objects: MT config fetch failed for %s",
-                        collection_name,
-                        exc_info=True,
-                    )
-
-                if is_multi_tenant:
+                if _is_multi_tenant(cfg):
                     try:
                         tenants = collection.tenants.get() or {}
                     except Exception:

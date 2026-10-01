@@ -1,212 +1,95 @@
 """
-Background QThread workers for Kubernetes pod operations.
+Background workers for Kubernetes pod operations.
 
-PodListWorker   – lists all pods in the namespace via kubectl get pods -o json
-PodDetailWorker – fetches full pod manifest + events for a single pod
+PodListWorker   – lists all pods in the namespace, optionally followed by the
+                  cross-pod resource comparison.
+PodDetailWorker – fetches the full manifest + events for a single pod.
 
-The bridge (BridgeCoordinator) must have already configured kubectl credentials
-before these workers are invoked.
+All kubectl calls live in ``core/infra/pods/`` — these workers only run them off
+the UI thread. The bridge (BridgeCoordinator) must already have configured
+kubectl credentials.
 """
 
-import json
 import logging
-import subprocess
 
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import pyqtSignal
+
+from core.infra.pods import build_pod_comparison, fetch_pod_detail, fetch_pods
+from shared.base_worker import BaseWorker
 
 logger = logging.getLogger(__name__)
 
-_TIMEOUT = 30
 
-
-# ---------------------------------------------------------------------------
-# Fetch helpers (pure functions, usable outside of QThread context)
-# ---------------------------------------------------------------------------
-
-
-def fetch_pods(namespace: str) -> list[dict]:
+class PodListWorker(BaseWorker):
     """
-    Fetch all pods in ``namespace`` via ``kubectl get pods -n <namespace> -o json``.
+    List all pods in a namespace.
 
-    Returns
-    -------
-    list[dict]
-        List of pod manifest dicts from the items array.
-
-    Raises
-    ------
-    RuntimeError
-        On kubectl failure, timeout, or JSON parse error.
-    """
-    cmd = ["kubectl", "get", "pods", "-n", namespace, "-o", "json"]
-    logger.debug("Listing pods: %s", " ".join(cmd))
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=_TIMEOUT)
-    except FileNotFoundError as err:
-        raise RuntimeError(
-            "kubectl not found. Make sure kubectl is installed and on your PATH."
-        ) from err
-    except subprocess.TimeoutExpired as err:
-        raise RuntimeError(f"Timed out listing pods (>{_TIMEOUT} s).") from err
-
-    if result.returncode != 0:
-        err = result.stderr.strip() or result.stdout.strip()
-        raise RuntimeError(f"kubectl error (exit {result.returncode}): {err}")
-
-    try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Failed to parse pods JSON: {exc}") from exc
-
-    return data.get("items", [])
-
-
-def fetch_pod_detail(namespace: str, pod_name: str) -> tuple[dict, list[dict]]:
-    """
-    Fetch full pod manifest and events for a single pod.
-
-    Returns
-    -------
-    (pod_dict, events_list)
-        ``pod_dict``   – parsed ``kubectl get pod -o json`` output.
-        ``events_list`` – list of event dicts (up to 20, sorted by lastTimestamp).
-
-    Raises
-    ------
-    RuntimeError
-        On kubectl failure or JSON parse error for the pod manifest.
-        Event fetch failures are silently ignored (non-critical).
-    """
-    # -- 1. Pod manifest JSON -----------------------------------------------
-    cmd_pod = ["kubectl", "get", "pod", pod_name, "-n", namespace, "-o", "json"]
-    logger.debug("Fetching pod detail: %s", " ".join(cmd_pod))
-
-    try:
-        result_pod = subprocess.run(cmd_pod, capture_output=True, text=True, timeout=_TIMEOUT)
-    except FileNotFoundError as err:
-        raise RuntimeError(
-            "kubectl not found. Make sure kubectl is installed and on your PATH."
-        ) from err
-    except subprocess.TimeoutExpired as err:
-        raise RuntimeError(f"Timed out fetching pod manifest (>{_TIMEOUT} s).") from err
-
-    if result_pod.returncode != 0:
-        err = result_pod.stderr.strip() or result_pod.stdout.strip()
-        raise RuntimeError(f"kubectl error (exit {result_pod.returncode}): {err}")
-
-    try:
-        pod_data = json.loads(result_pod.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Failed to parse pod JSON: {exc}") from exc
-
-    # -- 2. Events (non-critical, failures are silently swallowed) -----------
-    events: list[dict] = []
-    try:
-        cmd_events = [
-            "kubectl",
-            "get",
-            "events",
-            f"--field-selector=involvedObject.name={pod_name}",
-            "-n",
-            namespace,
-            "-o",
-            "json",
-            "--sort-by=.lastTimestamp",
-        ]
-        result_events = subprocess.run(cmd_events, capture_output=True, text=True, timeout=_TIMEOUT)
-        if result_events.returncode == 0:
-            ev_data = json.loads(result_events.stdout)
-            items = ev_data.get("items", [])
-            events = items[-20:] if len(items) > 20 else items
-    except Exception:
-        pass  # events are informational; don't fail the whole fetch
-
-    return pod_data, events
-
-
-# ---------------------------------------------------------------------------
-# Workers
-# ---------------------------------------------------------------------------
-
-
-class PodListWorker(QThread):
-    """
-    Lists all pods in the given namespace.
-
-    Parameters
-    ----------
-    namespace:
-        Kubernetes namespace to query.
+    With ``with_comparison=True`` the pod list is emitted first (so the table
+    fills immediately) and the slower comparison — ``kubectl top`` and node
+    lookups — follows as the terminal signal.
 
     Signals
     -------
     pods_ready(list)
-        Emitted with the list of pod manifest dicts on success.
-    progress(str)
-        Status messages during the fetch.
-    error(str)
-        Error message on failure.
+        Pod manifest dicts.
+    comparison_ready(dict)
+        ``build_pod_comparison`` result. Only emitted with ``with_comparison``.
+    progress(str), error(str)
+        Inherited from :class:`BaseWorker`.
     """
 
     pods_ready = pyqtSignal(list)
-    progress = pyqtSignal(str)
-    error = pyqtSignal(str)
+    comparison_ready = pyqtSignal(dict)
 
-    def __init__(self, namespace: str, parent: object | None = None) -> None:
+    def __init__(
+        self,
+        namespace: str,
+        *,
+        with_comparison: bool = False,
+        parent: object | None = None,
+    ) -> None:
         super().__init__(parent)
-        self.namespace = namespace
+        self._namespace = namespace
+        self._with_comparison = with_comparison
 
     def run(self) -> None:
         try:
-            self.progress.emit(f"Listing pods in namespace '{self.namespace}'…")
-            pods = fetch_pods(self.namespace)
+            self.progress.emit(f"Listing pods in namespace '{self._namespace}'…")
+            pods = fetch_pods(self._namespace)
             self.pods_ready.emit(pods)
+            if not self._with_comparison or self._cancelled:
+                return
+            self.progress.emit("Comparing pods — fetching live usage…")
+            self.comparison_ready.emit(build_pod_comparison(self._namespace, pods))
         except Exception as exc:
             logger.exception("PodListWorker error")
             self.error.emit(str(exc))
 
 
-class PodDetailWorker(QThread):
+class PodDetailWorker(BaseWorker):
     """
-    Fetches full details for a single pod.
-
-    Parameters
-    ----------
-    namespace:
-        Kubernetes namespace.
-    pod_name:
-        Name of the pod to fetch.
+    Fetch the full manifest and recent events for a single pod.
 
     Signals
     -------
     pod_ready(dict, list)
-        Emitted with (pod_manifest_dict, events_list) on success.
-    progress(str)
-        Status messages during the fetch.
-    error(str)
-        Error message on failure.
+        ``(pod_manifest, events)``.
+    progress(str), error(str)
+        Inherited from :class:`BaseWorker`.
     """
 
     pod_ready = pyqtSignal(dict, list)
-    progress = pyqtSignal(str)
-    error = pyqtSignal(str)
 
-    def __init__(
-        self,
-        namespace: str,
-        pod_name: str,
-        parent: object | None = None,
-    ) -> None:
+    def __init__(self, namespace: str, pod_name: str, parent: object | None = None) -> None:
         super().__init__(parent)
-        self.namespace = namespace
-        self.pod_name = pod_name
+        self._namespace = namespace
+        self._pod_name = pod_name
 
     def run(self) -> None:
         try:
-            self.progress.emit(f"Fetching pod '{self.pod_name}' in namespace '{self.namespace}'…")
-            pod_data, events = fetch_pod_detail(self.namespace, self.pod_name)
-            self.pod_ready.emit(pod_data, events)
+            self.progress.emit(f"Fetching pod '{self._pod_name}' in namespace '{self._namespace}'…")
+            pod, events = fetch_pod_detail(self._namespace, self._pod_name)
+            self.pod_ready.emit(pod, events)
         except Exception as exc:
             logger.exception("PodDetailWorker error")
             self.error.emit(str(exc))

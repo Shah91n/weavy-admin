@@ -3,8 +3,8 @@
 import contextlib
 import logging
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor
+from PyQt6.QtCore import QItemSelectionModel, Qt
+from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
@@ -20,11 +20,14 @@ from PyQt6.QtWidgets import (
 
 from core.weaviate.schema import get_all_shards, update_shards_status
 from features.shards.worker import AllShardsWorker, UpdateShardsStatusWorker
+from shared.styles.global_qss import COLOR_WARNING_YELLOW
 from shared.worker_mixin import WorkerMixin, _orphan_worker
 
 logger = logging.getLogger(__name__)
 
-_READONLY_BG = QColor(255, 200, 100)  # amber for READONLY rows
+# A stylesheet rule on QTableWidget::item would override setBackground(), so the
+# READONLY marker is a foreground colour — the only per-item brush QSS honours.
+_READONLY_FG = QBrush(QColor(COLOR_WARNING_YELLOW))
 
 
 class ShardsIndexingView(QWidget, WorkerMixin):
@@ -148,8 +151,29 @@ class ShardsIndexingView(QWidget, WorkerMixin):
         self.refresh_btn.setEnabled(True)
 
     # --------------------------------------------------------------- render
+    @staticmethod
+    def _shard_key(shard: dict) -> tuple[str, str, str]:
+        """Identity of a shard replica — stable across refreshes and re-sorts."""
+        return (
+            str(shard.get("collection", "")),
+            str(shard.get("shard_name", "")),
+            str(shard.get("node", "")),
+        )
+
     def _render_table(self, shards: list) -> None:
+        """
+        Repopulate the table.
+
+        Sorting MUST be off while filling: QTableWidget re-sorts on every setItem()
+        when it is on, which shuffles half-written rows and leaves empty cells
+        behind. The user's sort column/order and row selection are captured first
+        and restored afterwards so a refresh does not disturb the view.
+        """
+        keep_selected = {self._shard_key(s) for s in self._selected_shards()}
+
         self.table.blockSignals(True)
+        self.table.setSortingEnabled(False)
+        self.table.setUpdatesEnabled(False)
         self.table.clearContents()
         self.table.setColumnCount(len(self.COLUMNS))
         self.table.setRowCount(len(shards))
@@ -158,22 +182,48 @@ class ShardsIndexingView(QWidget, WorkerMixin):
         for row, shard in enumerate(shards):
             is_readonly = "READONLY" in str(shard.get("status", "")).upper()
             for col, key in enumerate(self.COLUMNS):
-                item = QTableWidgetItem(str(shard.get(key, "")))
+                value = shard.get(key, "")
+                item = QTableWidgetItem()
+                if key == "object_count" and isinstance(value, int):
+                    # Numeric DisplayRole so the column sorts 9 < 10, not "10" < "9".
+                    item.setData(Qt.ItemDataRole.DisplayRole, value)
+                else:
+                    item.setData(Qt.ItemDataRole.DisplayRole, str(value))
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if is_readonly:
-                    item.setBackground(_READONLY_BG)
+                    item.setForeground(_READONLY_FG)
+                if col == 0:
+                    # Row → shard mapping must survive sorting, so carry the shard
+                    # on the item itself rather than indexing self._all_shards[row].
+                    item.setData(Qt.ItemDataRole.UserRole, shard)
                 self.table.setItem(row, col, item)
 
+        # Re-enabling replays the user's existing sort indicator, if any.
+        self.table.setSortingEnabled(True)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self._restore_selection(keep_selected)
+        self.table.setUpdatesEnabled(True)
         self.table.blockSignals(False)
         self.table.setVisible(True)
         self._on_selection_changed()
 
+    def _restore_selection(self, keys: set[tuple[str, str, str]]) -> None:
+        """Reselect the rows whose shards were selected before the repopulate."""
+        if not keys:
+            return
+        selection = self.table.selectionModel()
+        selection.clearSelection()
+        model = self.table.model()
+        flags = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+        for row in range(self.table.rowCount()):
+            shard = self._shard_at(row)
+            if shard is not None and self._shard_key(shard) in keys:
+                selection.select(model.index(row, 0), flags)
+
     # --------------------------------------------------------- selection bar
     def _on_selection_changed(self) -> None:
-        selected_rows = {idx.row() for idx in self.table.selectedIndexes()}
-        count = len(selected_rows)
+        count = len(self._selected_shards())
         if count == 0:
             self.selection_label.setText("No shards selected")
         else:
@@ -181,9 +231,21 @@ class ShardsIndexingView(QWidget, WorkerMixin):
         self.set_ready_btn.setEnabled(count > 0)
         self.set_readonly_btn.setEnabled(count > 0)
 
+    def _shard_at(self, row: int) -> dict | None:
+        """The shard backing a *visual* row, independent of the current sort order."""
+        item = self.table.item(row, 0)
+        if item is None:
+            return None
+        shard = item.data(Qt.ItemDataRole.UserRole)
+        return shard if isinstance(shard, dict) else None
+
     def _selected_shards(self) -> list[dict]:
-        rows = sorted({idx.row() for idx in self.table.selectedIndexes()})
-        return [self._all_shards[r] for r in rows if r < len(self._all_shards)]
+        shards = []
+        for row in sorted({idx.row() for idx in self.table.selectedIndexes()}):
+            shard = self._shard_at(row)
+            if shard is not None:
+                shards.append(shard)
+        return shards
 
     # -------------------------------------------------------------- actions
     def _on_set_all_ready(self) -> None:
@@ -223,29 +285,29 @@ class ShardsIndexingView(QWidget, WorkerMixin):
             return
         self._run_update(shards, status)
 
+    def _detach_update_worker(self) -> None:
+        """WorkerMixin only manages self._worker; this view owns a second worker."""
+        if self._update_worker is None:
+            return
+        for sig in ("finished", "error"):
+            with contextlib.suppress(RuntimeError, TypeError, AttributeError):
+                getattr(self._update_worker, sig).disconnect()
+        if self._update_worker.isRunning():
+            _orphan_worker(self._update_worker)
+        else:
+            self._update_worker.deleteLater()
+        self._update_worker = None
+
     def _run_update(self, shards: list, status: str) -> None:
         self._set_all_buttons(False)
-        if self._update_worker is not None:
-            with contextlib.suppress(RuntimeError, TypeError):
-                self._update_worker.finished.disconnect()
-            with contextlib.suppress(RuntimeError, TypeError):
-                self._update_worker.error.disconnect()
-            if self._update_worker.isRunning():
-                _orphan_worker(self._update_worker)
-            else:
-                self._update_worker.deleteLater()
-            self._update_worker = None
+        self._detach_update_worker()
         self._update_worker = UpdateShardsStatusWorker(update_shards_status, shards, status)
         self._update_worker.finished.connect(self._on_update_finished)
         self._update_worker.error.connect(self._on_update_error)
         self._update_worker.start()
 
     def _on_update_finished(self, result: dict) -> None:
-        if self._update_worker is not None:
-            self._update_worker.finished.disconnect()
-            self._update_worker.error.disconnect()
-            self._update_worker.deleteLater()
-            self._update_worker = None
+        self._detach_update_worker()
         success = result.get("success", 0)
         failed = result.get("failed", 0)
         if failed == 0:
@@ -260,12 +322,14 @@ class ShardsIndexingView(QWidget, WorkerMixin):
         self.load_data()
 
     def _on_update_error(self, error_msg: str) -> None:
-        if self._update_worker is not None:
-            self._update_worker.finished.disconnect()
-            self._update_worker.error.disconnect()
-            self._update_worker.deleteLater()
-            self._update_worker = None
-        self._set_all_buttons(True)
+        self._detach_update_worker()
+        # Restore each button to what the current data actually allows, rather
+        # than blanket-enabling "Set Selected" with nothing selected.
+        self.refresh_btn.setEnabled(True)
+        self.set_all_ready_btn.setEnabled(
+            any("READONLY" in str(s.get("status", "")).upper() for s in self._all_shards)
+        )
+        self._on_selection_changed()
         QMessageBox.critical(self, "Error", f"Failed to update shards:\n{error_msg}")
 
     def _set_all_buttons(self, enabled: bool) -> None:
@@ -277,13 +341,4 @@ class ShardsIndexingView(QWidget, WorkerMixin):
     def cleanup(self) -> None:
         """Disconnect and orphan/delete workers on tab close."""
         self._detach_worker()  # handles self._worker
-        if self._update_worker is not None:
-            with contextlib.suppress(RuntimeError, TypeError):
-                self._update_worker.finished.disconnect()
-            with contextlib.suppress(RuntimeError, TypeError):
-                self._update_worker.error.disconnect()
-            if self._update_worker.isRunning():
-                _orphan_worker(self._update_worker)
-            else:
-                self._update_worker.deleteLater()
-            self._update_worker = None
+        self._detach_update_worker()
