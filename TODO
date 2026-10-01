@@ -1,4 +1,4 @@
 - Implement a live monitoring dashboard
-- Logs: add a loading spinner while fetching
-- LB logs aren't easily expandable - improve that
-- Pod Status in Cluster Profiling should be in the same box as Live Logs and print out the same way
+- Pods: `_on_pods_ready` skips `_detach_worker()` on purpose (comparison_ready follows) — revisit if the "detach first" rule should allow non-terminal signals explicitly
+- StatefulSet view: reuse the pod detail `_FitTable` + `_WrapDelegate` (fit-to-content columns, wrap long values) — promote to shared/ once a second feature uses them
+- Fix remaining cross-feature imports: cluster/view_generic → config, diagnose → shards.worker, query → schema.worker

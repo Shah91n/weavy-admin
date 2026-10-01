@@ -471,8 +471,15 @@ class ShardRebalancerView(QWidget):
     _DIST_COLS = ["Shard", "Node", "Objects", "RF (replicas)"]
 
     def _render_dist_table(self, rows: list[dict]) -> None:
+        # Sorting stays off while filling: QTableWidget re-sorts on every setItem()
+        # when it is on, shuffling half-written rows and leaving empty cells behind.
         tbl = self._dist_table
+        prev = self._selected_dist_row()
+        prev_key = (prev.get("shard_name"), prev.get("node")) if prev else None
+
         tbl.blockSignals(True)
+        tbl.setSortingEnabled(False)
+        tbl.setUpdatesEnabled(False)
         tbl.clearContents()
         tbl.setColumnCount(len(self._DIST_COLS))
         tbl.setRowCount(len(rows))
@@ -488,10 +495,21 @@ class ShardRebalancerView(QWidget):
             for c, val in enumerate(values):
                 item = QTableWidgetItem(val)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if c == 0:
+                    # Row → data mapping must survive sorting.
+                    item.setData(Qt.ItemDataRole.UserRole, row)
                 tbl.setItem(r, c, item)
 
+        tbl.setSortingEnabled(True)
         tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         tbl.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        if prev_key is not None:
+            for r in range(tbl.rowCount()):
+                row = self._row_payload(tbl, r)
+                if row is not None and (row.get("shard_name"), row.get("node")) == prev_key:
+                    tbl.selectRow(r)
+                    break
+        tbl.setUpdatesEnabled(True)
         tbl.blockSignals(False)
         tbl.setVisible(True)
         self._on_dist_selection_changed()
@@ -507,8 +525,14 @@ class ShardRebalancerView(QWidget):
     ]
 
     def _render_ops_table(self, ops: list[dict]) -> None:
+        # Sorting stays off while filling — see _render_dist_table.
         tbl = self._ops_table
+        prev = self._selected_op()
+        prev_id = prev.get("id") if prev else None
+
         tbl.blockSignals(True)
+        tbl.setSortingEnabled(False)
+        tbl.setUpdatesEnabled(False)
         tbl.clearContents()
         tbl.setColumnCount(len(self._OPS_COLS))
         tbl.setRowCount(len(ops))
@@ -529,15 +553,26 @@ class ShardRebalancerView(QWidget):
                 item = QTableWidgetItem(str(val))
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 # Status column gets a dedicated objectName for colour styling
-                if c == 6:
+                if c == 0:
+                    # Row → data mapping must survive sorting.
+                    item.setData(Qt.ItemDataRole.UserRole, op)
+                elif c == 6:
                     item.setData(
                         Qt.ItemDataRole.UserRole,
                         _status_object_name(status),
                     )
                 tbl.setItem(r, c, item)
 
+        tbl.setSortingEnabled(True)
         tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         tbl.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        if prev_id is not None:
+            for r in range(tbl.rowCount()):
+                op = self._row_payload(tbl, r)
+                if op is not None and op.get("id") == prev_id:
+                    tbl.selectRow(r)
+                    break
+        tbl.setUpdatesEnabled(True)
         tbl.blockSignals(False)
         tbl.setVisible(True)
         self._ops_status.setVisible(False)
@@ -580,13 +615,20 @@ class ShardRebalancerView(QWidget):
         self._move_btn.setEnabled(has_sel)
         self._copy_btn.setEnabled(has_sel)
 
+    @staticmethod
+    def _row_payload(tbl: QTableWidget, row: int) -> dict | None:
+        """The dict backing a *visual* row, independent of the current sort order."""
+        item = tbl.item(row, 0)
+        if item is None:
+            return None
+        payload = item.data(Qt.ItemDataRole.UserRole)
+        return payload if isinstance(payload, dict) else None
+
     def _selected_dist_row(self) -> dict | None:
         rows_idx = {idx.row() for idx in self._dist_table.selectedIndexes()}
         if not rows_idx:
             return None
-        r = next(iter(rows_idx))
-        data_rows = self._distribution_data.get("rows", [])
-        return data_rows[r] if r < len(data_rows) else None
+        return self._row_payload(self._dist_table, next(iter(rows_idx)))
 
     def _on_ops_selection_changed(self) -> None:
         op = self._selected_op()
@@ -614,8 +656,7 @@ class ShardRebalancerView(QWidget):
         rows_idx = {idx.row() for idx in self._ops_table.selectedIndexes()}
         if not rows_idx:
             return None
-        r = next(iter(rows_idx))
-        return self._operations_data[r] if r < len(self._operations_data) else None
+        return self._row_payload(self._ops_table, next(iter(rows_idx)))
 
     # --------------------------------------------------- replication dialog
 

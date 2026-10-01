@@ -22,17 +22,22 @@ import logging
 from collections.abc import Callable
 from datetime import datetime, timezone
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QBrush, QColor
+from PyQt6.QtCore import QModelIndex, QRect, QSize, Qt, QTimer
+from PyQt6.QtGui import QBrush, QColor, QPainter, QPalette, QResizeEvent, QShowEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QAbstractScrollArea,
+    QApplication,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -41,6 +46,7 @@ from PyQt6.QtWidgets import (
 )
 
 from features.infra.pods.worker import PodDetailWorker
+from shared.loading_bar import LoadingBar
 from shared.styles.infra_qss import (
     COLOR_BRIDGE_CONNECTED,
     COLOR_BRIDGE_ERROR,
@@ -63,10 +69,18 @@ _ENV_EXCLUDE = {"ENABLE_MODULES"}
 # ---------------------------------------------------------------------------
 # Status indicator constants: (display_text, hex_colour)
 # ---------------------------------------------------------------------------
-_ST_OK = ("✅  Healthy", COLOR_BRIDGE_CONNECTED)
-_ST_WARN = ("⚠️  Warning", COLOR_BRIDGE_PENDING)
-_ST_ERROR = ("❌  Error", COLOR_BRIDGE_ERROR)
 _ST_NONE = ("—", INFRA_TEXT_MUTED)
+
+# Widest a sized-to-content (non-stretch) column may grow before its text wraps.
+_MAX_COL_WIDTH = 340
+# Horizontal space a cell loses to padding: QSS ``stsTable::item`` 10px a side
+# plus Qt's own text margin. Overestimated on purpose — a row a little too tall
+# is fine, one too short clips text.
+_CELL_H_PADDING = 32
+_WRAP_FLAGS = Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextWrapAnywhere
+_FIT_EXTRA_WIDTH = 16  # > _CELL_H_PADDING minus the 20px QSS padding Qt already counts
+# Breathing room under the last line of a wrapped cell.
+_WRAP_V_SLACK = 6
 
 
 # ---------------------------------------------------------------------------
@@ -98,21 +112,6 @@ def _get(data: object, *path: object, default: str = "N/A") -> str:
         if val is None:
             return default
     return str(val) if val is not None else default
-
-
-def _get_raw(data: object, *path: object, default: object = None) -> object:
-    """Same as _get but returns the raw un-stringified value."""
-    val: object = data
-    for key in path:
-        if isinstance(val, dict):
-            val = val.get(key)  # type: ignore[arg-type]
-        elif isinstance(val, list) and isinstance(key, int):
-            val = val[key] if 0 <= key < len(val) else None
-        else:
-            val = None
-        if val is None:
-            return default
-    return val
 
 
 def _fmt_ts(ts: str) -> str:
@@ -226,28 +225,6 @@ def _bool_status(val: bool) -> tuple[str, str]:
     return ("❌  False", COLOR_BRIDGE_ERROR)
 
 
-def _condition_status(status_str: str) -> tuple[str, str]:
-    if status_str == "True":
-        return ("✅  True", COLOR_BRIDGE_CONNECTED)
-    if status_str == "False":
-        return ("❌  False", COLOR_BRIDGE_ERROR)
-    return (status_str or "Unknown", INFRA_TEXT_MUTED)
-
-
-def _truncate_hash(s: str, length: int = 32) -> str:
-    """Truncate long container/image IDs while preserving the end."""
-    if not s or s == "N/A":
-        return s
-    if "://" in s:
-        proto, rest = s.split("://", 1)
-        if len(rest) > length:
-            return f"{proto}://…{rest[-length:]}"
-        return s
-    if len(s) > length:
-        return f"…{s[-length:]}"
-    return s
-
-
 def _env_value_and_source(env_entry: dict) -> tuple[str, str]:
     """Extract display value and source label from a single env entry dict."""
     if "value" in env_entry:
@@ -351,6 +328,154 @@ def _volume_details(volume: dict) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 
+class _WrapDelegate(QStyledItemDelegate):
+    """
+    Wrap long cell text anywhere, not just at spaces.
+
+    Under a stylesheet Qt both measures and paints wrapped cells at word
+    boundaries only, so a long value with no spaces (comma lists, image IDs,
+    JSON) stays on one line and is elided. Cells whose text needs more than one
+    line are measured and painted here with word-or-anywhere wrapping; every
+    other cell goes through the default path untouched.
+    """
+
+    @staticmethod
+    def _wrapped_height(option: QStyleOptionViewItem, text: str) -> int | None:
+        """Height of *text* wrapped to the cell, or None when it fits on one line."""
+        width = option.rect.width() - _CELL_H_PADDING
+        if not text or width <= 0:
+            return None
+        fm = option.fontMetrics
+        height = fm.boundingRect(QRect(0, 0, width, 1_000_000), _WRAP_FLAGS, text).height()
+        return height if height > fm.height() else None
+
+    def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:  # noqa: N802
+        hint = super().sizeHint(option, index)
+        text_h = self._wrapped_height(option, str(index.data() or ""))
+        if text_h is None:
+            return hint
+        # hint already includes one line plus vertical padding; add the extra lines.
+        return QSize(
+            hint.width(), hint.height() - option.fontMetrics.height() + text_h + _WRAP_V_SLACK
+        )
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        text = opt.text
+        if self._wrapped_height(opt, text) is None:
+            super().paint(painter, option, index)
+            return
+
+        # Background, selection and borders from the style; text drawn by hand.
+        style = opt.widget.style() if opt.widget else QApplication.style()
+        opt.text = ""
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+        text_rect = style.subElementRect(QStyle.SubElement.SE_ItemViewItemText, opt, opt.widget)
+        selected = bool(opt.state & QStyle.StateFlag.State_Selected)
+        role = QPalette.ColorRole.HighlightedText if selected else QPalette.ColorRole.Text
+        painter.save()
+        painter.setFont(opt.font)
+        painter.setPen(opt.palette.color(role))
+        painter.drawText(
+            text_rect,
+            int(_WRAP_FLAGS | Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+            text,
+        )
+        painter.restore()
+
+
+class _FitTable(QTableWidget):
+    """
+    Read-only table that always shows every row in full.
+
+    Columns are sized to their content (capped at ``_MAX_COL_WIDTH``) with one
+    stretch column taking the remaining width, and long values wrap instead of
+    being elided.
+
+    Two timing details matter:
+
+    * Column widths are measured on first show. Before that the table has no
+      parent, so the infra stylesheet (monospace font + cell padding) is not
+      applied yet and every measurement comes out too narrow.
+    * Row heights depend on the final column widths, which the header only
+      settles after the table's own resize — so the height refit is queued
+      on ``sectionResized`` rather than done inline.
+    """
+
+    def __init__(self, rows: int, cols: int, headers: list[str], stretch_col: int) -> None:
+        super().__init__(rows, cols)
+        self._stretch_col = stretch_col
+        self.setObjectName("stsTable")
+        self.setHorizontalHeaderLabels(headers)
+        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.setWordWrap(True)
+        self.setItemDelegate(_WrapDelegate(self))
+        self.verticalHeader().setVisible(False)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setSizeAdjustPolicy(QAbstractScrollArea.SizeAdjustPolicy.AdjustToContents)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self._columns_fitted = False
+        self._height_queued = False
+        self.horizontalHeader().sectionResized.connect(self._queue_fit_height)
+
+    def fit(self) -> None:
+        """Call once the cells are filled: set column modes and a first height."""
+        header = self.horizontalHeader()
+        for col in range(self.columnCount()):
+            mode = (
+                QHeaderView.ResizeMode.Stretch
+                if col == self._stretch_col
+                else QHeaderView.ResizeMode.Interactive
+            )
+            header.setSectionResizeMode(col, mode)
+        self._fit_height()
+
+    def showEvent(self, event: QShowEvent) -> None:  # noqa: N802 — Qt override
+        super().showEvent(event)
+        if not self._columns_fitted:
+            self._columns_fitted = True
+            self._fit_columns()
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 — Qt override
+        super().resizeEvent(event)
+        self._queue_fit_height()
+
+    def _fit_columns(self) -> None:
+        # Per column, skipping the stretch one: resizeColumnsToContents() would
+        # resize every section at once and override the Stretch mode.
+        for col in range(self.columnCount()):
+            if col == self._stretch_col:
+                continue
+            self.resizeColumnToContents(col)
+            # Qt fits to the QSS padding; _WrapDelegate reserves _CELL_H_PADDING,
+            # so add the difference or a fitted cell would be treated as wrapping.
+            width = self.columnWidth(col) + _FIT_EXTRA_WIDTH
+            self.setColumnWidth(col, min(width, _MAX_COL_WIDTH))
+        self._queue_fit_height()
+
+    def _queue_fit_height(self, *_args: object) -> None:
+        if not self._height_queued:
+            self._height_queued = True
+            QTimer.singleShot(0, self._fit_height)
+
+    def _fit_height(self) -> None:
+        self._height_queued = False
+        self.resizeRowsToContents()
+        header_h = self.horizontalHeader().sizeHint().height()
+        rows_h = sum(self.rowHeight(r) for r in range(self.rowCount()))
+        scroll_h = (
+            self.horizontalScrollBar().sizeHint().height()
+            if self.horizontalScrollBar().isVisible()
+            else 0
+        )
+        height = header_h + rows_h + scroll_h + 4
+        if self.height() != height:
+            self.setFixedHeight(height)
+
+
 class PodDetailView(QWidget, WorkerMixin):
     """
     Pod Detail Dashboard – fetches and displays all operational data for
@@ -374,6 +499,7 @@ class PodDetailView(QWidget, WorkerMixin):
         self._namespace = namespace
         self._pod_name = pod_name
         self._worker: PodDetailWorker | None = None
+        self._alive: bool = True
         self._env_expanded = True
         self._labels_expanded = False
         self._annots_expanded = False
@@ -423,6 +549,8 @@ class PodDetailView(QWidget, WorkerMixin):
         layout.setSpacing(0)
 
         layout.addWidget(self._build_toolbar())
+        self._loading_bar = LoadingBar()
+        layout.addWidget(self._loading_bar)
 
         # Summary card (always visible)
         self._summary_card = self._build_empty_summary()
@@ -726,15 +854,15 @@ class PodDetailView(QWidget, WorkerMixin):
                 ("Image", container.get("image", "N/A"), _ST_NONE, "containers[].image"),
                 (
                     "Image ID",
-                    _truncate_hash(cs.get("imageID", "N/A")),
+                    cs.get("imageID", "N/A"),
                     _ST_NONE,
-                    "containers[].imageID (truncated)",
+                    "containers[].imageID",
                 ),
                 (
                     "Container ID",
-                    _truncate_hash(cs.get("containerID", "N/A")),
+                    cs.get("containerID", "N/A"),
                     _ST_NONE,
-                    "containers[].containerID (truncated)",
+                    "containers[].containerID",
                 ),
                 ("State", state_text, (state_text, state_color), "containers[].state"),
                 (
@@ -964,8 +1092,8 @@ class PodDetailView(QWidget, WorkerMixin):
         rows: list[list[str]] = []
         for entry in sorted(filtered, key=lambda e: e.get("name", "")):
             name = entry.get("name", "")
-            val, _ = _env_value_and_source(entry)
-            rows.append([name, val])
+            val, source = _env_value_and_source(entry)
+            rows.append([name, val, source])
 
         group2 = QGroupBox()
         group2.setObjectName("stsSection")
@@ -986,7 +1114,7 @@ class PodDetailView(QWidget, WorkerMixin):
 
         env_table = self._make_plain_table(
             "",
-            ["Variable", "Value"],
+            ["Variable", "Value", "Source"],
             rows,
             stretch_col=1,
             as_bare_table=True,
@@ -1138,10 +1266,7 @@ class PodDetailView(QWidget, WorkerMixin):
         # --- Table 13: Annotations (collapsible) ---
         annotations = meta.get("annotations", {})
         if annotations:
-            annot_rows = [
-                [k, (str(v)[:120] + "…" if len(str(v)) > 120 else str(v))]
-                for k, v in sorted(annotations.items())
-            ]
+            annot_rows = [[k, str(v)] for k, v in sorted(annotations.items())]
             cl.addWidget(
                 self._build_collapsible_table(
                     "Annotations",
@@ -1295,15 +1420,7 @@ class PodDetailView(QWidget, WorkerMixin):
         layout.setContentsMargins(0, 4, 0, 4)
         layout.setSpacing(0)
 
-        table = QTableWidget(len(rows), 3)
-        table.setObjectName("stsTable")
-        table.setHorizontalHeaderLabels(["Field", "Value", "Status"])
-        self._configure_table(table)
-        table.setColumnWidth(0, 200)
-        table.setColumnWidth(2, 160)
-        table.horizontalHeader().setSectionResizeMode(
-            1, table.horizontalHeader().ResizeMode.Stretch
-        )
+        table = _FitTable(len(rows), 3, ["Field", "Value", "Status"], stretch_col=1)
 
         for row_idx, row_data in enumerate(rows):
             field, value = row_data[0], row_data[1]
@@ -1321,6 +1438,7 @@ class PodDetailView(QWidget, WorkerMixin):
             value_item = QTableWidgetItem(str(value))
             value_item.setFlags(value_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             value_item.setForeground(QBrush(QColor(INFRA_TEXT_PRIMARY)))
+            value_item.setToolTip(str(value))
             table.setItem(row_idx, 1, value_item)
 
             status_item = QTableWidgetItem(st_text)
@@ -1329,8 +1447,7 @@ class PodDetailView(QWidget, WorkerMixin):
             status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             table.setItem(row_idx, 2, status_item)
 
-        table.resizeRowsToContents()
-        self._fix_table_height(table)
+        table.fit()
         layout.addWidget(table)
         return group
 
@@ -1353,15 +1470,8 @@ class PodDetailView(QWidget, WorkerMixin):
             Optional callable(row_idx, row_data, table) that can apply
             per-row styling after all items are set.
         """
-        table = QTableWidget(len(rows), len(headers))
-        table.setObjectName("stsTable")
-        table.setHorizontalHeaderLabels(headers)
-        self._configure_table(table)
-
         col_stretch = stretch_col if stretch_col >= 0 else len(headers) - 1
-        table.horizontalHeader().setSectionResizeMode(
-            col_stretch, table.horizontalHeader().ResizeMode.Stretch
-        )
+        table = _FitTable(len(rows), len(headers), headers, stretch_col=col_stretch)
 
         for r, row in enumerate(rows):
             for c, text in enumerate(row):
@@ -1370,13 +1480,13 @@ class PodDetailView(QWidget, WorkerMixin):
                 item.setForeground(QBrush(QColor(INFRA_TEXT_PRIMARY)))
                 if c == 0 and tooltips and text in tooltips:
                     item.setToolTip(tooltips[text])
+                else:
+                    item.setToolTip(str(text))
                 table.setItem(r, c, item)
             if row_colorizer:
                 row_colorizer(r, row, table)
 
-        self._fit_header_widths(table, skip_col=col_stretch)
-        table.resizeRowsToContents()
-        self._fix_table_height(table)
+        table.fit()
 
         if as_bare_table or not title:
             return table
@@ -1458,67 +1568,43 @@ class PodDetailView(QWidget, WorkerMixin):
                 item.setForeground(QBrush(QColor(color)))
 
     # ------------------------------------------------------------------
-    # Table utilities
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _configure_table(table: QTableWidget) -> None:
-        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        table.verticalHeader().setVisible(False)
-        table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        table.setSizeAdjustPolicy(QAbstractScrollArea.SizeAdjustPolicy.AdjustToContents)
-        table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
-
-    @staticmethod
-    def _fit_header_widths(table: QTableWidget, skip_col: int = -1) -> None:
-        """Ensure each column is at least wide enough to show its header label."""
-        hdr = table.horizontalHeader()
-        fm = hdr.fontMetrics()
-        for col in range(table.columnCount()):
-            if col == skip_col:
-                continue
-            hi = table.horizontalHeaderItem(col)
-            if not hi:
-                continue
-            min_w = fm.horizontalAdvance(hi.text()) + 24
-            if table.columnWidth(col) < min_w:
-                table.setColumnWidth(col, min_w)
-
-    @staticmethod
-    def _fix_table_height(table: QTableWidget) -> None:
-        """Force the table to show all rows without an internal scrollbar."""
-        header_h = table.horizontalHeader().sizeHint().height()
-        rows_h = sum(table.rowHeight(r) for r in range(table.rowCount()))
-        table.setFixedHeight(header_h + rows_h + 4)
-
-    # ------------------------------------------------------------------
     # Slots
     # ------------------------------------------------------------------
 
     def _on_pod_ready(self, pod: dict, events: list) -> None:
         self._detach_worker()
-        name = _get(pod, "metadata", "name")
-        ns = _get(pod, "metadata", "namespace")
-        phase = _get(pod, "status", "phase")
-        self._status_label.setText(f"Pod: {name}  |  Namespace: {ns}  |  Phase: {phase}")
-        self._populate(pod, events)
-        self._set_controls_enabled(True)
+        if not self._alive:
+            return
+        try:
+            name = _get(pod, "metadata", "name")
+            ns = _get(pod, "metadata", "namespace")
+            phase = _get(pod, "status", "phase")
+            self._status_label.setText(f"Pod: {name}  |  Namespace: {ns}  |  Phase: {phase}")
+            self._populate(pod, events)
+            self._set_controls_enabled(True)
+        except RuntimeError:
+            self._alive = False
 
     def _on_error(self, msg: str) -> None:
         self._detach_worker()
-        self._status_label.setText(f"Error: {msg}")
-        self._set_controls_enabled(True)
-        logger.error("PodDetailWorker error: %s", msg)
+        if not self._alive:
+            return
+        try:
+            self._status_label.setText(f"Error: {msg}")
+            self._set_controls_enabled(True)
+            logger.error("PodDetailWorker error: %s", msg)
+        except RuntimeError:
+            self._alive = False
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
     def _set_controls_enabled(self, enabled: bool) -> None:
+        self._loading_bar.set_busy(not enabled)
         self._refresh_btn.setEnabled(enabled)
 
     def cleanup(self) -> None:
-        """Disconnect and orphan/delete the worker on tab close."""
+        """Mark the view dead, then disconnect and orphan the worker on tab close."""
+        self._alive = False
         self._detach_worker()

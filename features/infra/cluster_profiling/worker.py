@@ -17,8 +17,8 @@ import time
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from core.infra.pods import fetch_pods
 from core.infra.profiling.profiling_bridge import ProfilingBridge
-from features.infra.pods.worker import fetch_pods
 
 logger = logging.getLogger(__name__)
 

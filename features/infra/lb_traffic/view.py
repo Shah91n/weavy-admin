@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -46,6 +47,8 @@ from PyQt6.QtWidgets import (
 )
 
 from core.infra.lb_traffic_utils import latency_as_float
+from shared.detail_pane import RowDetailPane, build_detail_fields
+from shared.loading_bar import LoadingBar
 from shared.styles.infra_qss import (
     COLOR_NET_ERROR_TEXT,
     COLOR_NET_LATENCY_HIGH,
@@ -234,7 +237,21 @@ class LBTrafficView(QWidget, WorkerMixin):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self._build_toolbar())
-        layout.addWidget(self._build_table())
+        self._loading_bar = LoadingBar()
+        layout.addWidget(self._loading_bar)
+
+        # Table over an expandable detail pane — selecting a row shows every
+        # field in full, so long paths / messages no longer need a modal.
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.setObjectName("detailSplitter")
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._build_table())
+        self._detail_pane = RowDetailPane()
+        splitter.addWidget(self._detail_pane)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([460, 240])  # px: table keeps roughly two thirds
+        layout.addWidget(splitter, 1)
 
     def _build_toolbar(self) -> QWidget:
         toolbar = QWidget()
@@ -336,6 +353,7 @@ class LBTrafficView(QWidget, WorkerMixin):
             self._table.setColumnWidth(col, width)
 
         self._table.cellDoubleClicked.connect(self._on_row_double_clicked)
+        self._table.itemSelectionChanged.connect(self._on_row_selected)
         return self._table
 
     # ------------------------------------------------------------------
@@ -370,6 +388,17 @@ class LBTrafficView(QWidget, WorkerMixin):
             logger.error("LBTrafficWorker error: %s", msg)
         except RuntimeError:
             self._alive = False
+
+    def _on_row_selected(self) -> None:
+        """Fill the detail pane from the selected row."""
+        if not self._alive:
+            return
+        rows = {idx.row() for idx in self._table.selectedIndexes()}
+        if not rows:
+            self._detail_pane.clear_entry()
+            return
+        fields, raw = build_detail_fields(self._table, min(rows), COLUMNS, COL_TIMESTAMP)
+        self._detail_pane.show_entry(fields, raw)
 
     def _on_row_double_clicked(self, row: int, _col: int) -> None:
         item = self._table.item(row, COL_TIMESTAMP)
@@ -499,6 +528,7 @@ class LBTrafficView(QWidget, WorkerMixin):
         self._status_label.setText(msg)
 
     def _set_controls_enabled(self, enabled: bool) -> None:
+        self._loading_bar.set_busy(not enabled)
         self._refresh_btn.setEnabled(enabled)
         self._time_combo.setEnabled(enabled)
         self._search_bar.setEnabled(enabled)

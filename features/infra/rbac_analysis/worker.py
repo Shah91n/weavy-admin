@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 _TAIL_PER_POD = 5000
 
 
-class RBACLogWorker(BaseWorker):
+class RBACAnalysisWorker(BaseWorker):
     """
     Fetch Kubernetes logs for every Weaviate pod and emit only RBAC entries.
 
@@ -47,5 +47,5 @@ class RBACLogWorker(BaseWorker):
             )
             self.logs_ready.emit(filter_rbac_entries(entries))
         except Exception as exc:
-            logger.exception("RBACLogWorker encountered an error")
+            logger.exception("RBACAnalysisWorker encountered an error")
             self.error.emit(str(exc))

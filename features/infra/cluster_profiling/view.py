@@ -12,13 +12,12 @@ Layout
 │ Save to:  [Choose Folder…]  /Users/x/profiles           │
 │                                                          │
 │ [▶ Start Capture]   [◼ Cancel]                          │
-├──────────────────────────────── Pod Status ──────────────┤
-│ weaviate-0  ▓▓▓▓▓▓▓▓▓▓ ✅ Complete   [▸ show files]    │
-│ weaviate-1  ▓▓▓▓▓░░░░░ Capturing heap…                  │
-│ weaviate-2  ░░░░░░░░░░ Waiting…                          │
-│                                                          │
-│ Overall:  ▓▓▓▓▓▓▓░░░ 56%  (1 of 3 pods)               │
-├──────────────────────────────── Live Log ────────────────┤
+├──────────────────────────────── Capture Output ──────────┤
+│ weaviate-0   [##########]  100%  ✅ Complete             │
+│ weaviate-1   [#####·····]   50%  Capturing heap…         │
+│ weaviate-2   [··········]    0%  Waiting…                │
+│ Overall      [#######···]   56%  (1 of 3 pods)           │
+│ ──────────────────────────────────────────────────────── │
 │ ▶ Connecting to cluster: weaviate-abc123                 │
 │ ▶ Found 3 pod(s): weaviate-0, weaviate-1, weaviate-2    │
 │ ▶ Created output directory: /Users/x/…                  │
@@ -32,9 +31,10 @@ Layout
 │ …                                                        │
 └──────────────────────────────────────────────────────────┘
 
-The log panel is a scrolling QPlainTextEdit (read-only, monospace) that
-mirrors exactly what the reference bash script prints.  The pod status rows
-update in real-time.  The view keeps running when the user switches tabs.
+Pod status and the live log share one bordered panel and one monospace font.
+The status block is pinned at the top and rewritten in place on every progress
+signal; the log scrolls underneath it and mirrors exactly what the reference
+bash script prints.  The view keeps running when the user switches tabs.
 """
 
 import logging
@@ -46,13 +46,12 @@ from PyQt6.QtGui import QFont, QTextCursor
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
-    QProgressBar,
     QPushButton,
     QRadioButton,
-    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -67,6 +66,12 @@ logger = logging.getLogger(__name__)
 
 _SETTINGS_KEY_FOLDER = "profiling/last_save_dir"
 _SETTINGS_KEY_DUR = "profiling/cluster_duration"
+
+# Text progress bar drawn in the pinned status block — same font as the log.
+_BAR_WIDTH = 10
+_BAR_FULL = "#"
+_BAR_EMPTY = "·"
+_STATUS_BLOCK_MAX_ROWS = 8  # status block scrolls past this; log keeps the space
 
 
 class ClusterProfilingView(QWidget, WorkerMixin):
@@ -91,7 +96,10 @@ class ClusterProfilingView(QWidget, WorkerMixin):
         self.cluster_id = cluster_id or self.namespace
         self._settings = QSettings()
         self._worker: ClusterProfilingWorker | None = None
-        self._pod_rows: dict[str, _PodRow] = {}
+        # Insertion-ordered: pod name -> (percent, status text). Rendered as the
+        # pinned text block above the log rather than as per-pod widgets.
+        self._pod_state: dict[str, tuple[int, str]] = {}
+        self._overall: tuple[int, int] = (0, 0)
         self._final_dir = ""
 
         root = QVBoxLayout(self)
@@ -110,51 +118,40 @@ class ClusterProfilingView(QWidget, WorkerMixin):
         # Settings panel
         root.addWidget(self._build_settings_panel())
 
-        # Pod status rows (populated when capture starts)
-        pods_hdr = QLabel("Pod Status")
-        pods_hdr.setObjectName("profilingSectionSubHeader")
-        root.addWidget(pods_hdr)
+        # Capture output — pod status and the live log share one bordered panel
+        # and one monospace font, so the whole capture reads as a single stream.
+        out_hdr = QLabel("Capture Output")
+        out_hdr.setObjectName("profilingSectionSubHeader")
+        root.addWidget(out_hdr)
 
-        self._pods_scroll = QScrollArea()
-        self._pods_scroll.setWidgetResizable(True)
-        self._pods_scroll.setMaximumHeight(220)
-        self._pods_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._pods_content = QWidget()
-        self._pods_layout = QVBoxLayout(self._pods_content)
-        self._pods_layout.setContentsMargins(0, 0, 0, 0)
-        self._pods_layout.setSpacing(4)
-        self._pods_layout.addStretch()
-        self._pods_scroll.setWidget(self._pods_content)
-        root.addWidget(self._pods_scroll)
+        out_box = QWidget()
+        out_box.setObjectName("profilingOutputBox")
+        out_layout = QVBoxLayout(out_box)
+        out_layout.setContentsMargins(0, 0, 0, 0)
+        out_layout.setSpacing(0)
 
-        # Overall progress
-        overall_row = QHBoxLayout()
-        overall_lbl = QLabel("Overall:")
-        overall_lbl.setObjectName("infraStatusLabel")
-        overall_lbl.setFixedWidth(60)
-        overall_row.addWidget(overall_lbl)
-        self._overall_bar = QProgressBar()
-        self._overall_bar.setObjectName("progressBar")
-        self._overall_bar.setRange(0, 100)
-        self._overall_bar.setValue(0)
-        overall_row.addWidget(self._overall_bar, 1)
-        self._overall_status = QLabel()
-        self._overall_status.setObjectName("infraStatusLabel")
-        self._overall_status.setFixedWidth(120)
-        overall_row.addWidget(self._overall_status)
-        root.addLayout(overall_row)
+        self._status_block = QPlainTextEdit()
+        self._status_block.setReadOnly(True)
+        self._status_block.setObjectName("profilingStatusBlock")
+        self._status_block.setFont(self._mono_font())
+        self._status_block.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self._status_block.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._status_block.setVisible(False)  # nothing to pin before a capture
+        out_layout.addWidget(self._status_block)
 
-        # Live log
-        log_hdr = QLabel("Live Log")
-        log_hdr.setObjectName("profilingSectionSubHeader")
-        root.addWidget(log_hdr)
+        self._status_divider = QFrame()
+        self._status_divider.setObjectName("profilingOutputDivider")
+        self._status_divider.setVisible(False)
+        out_layout.addWidget(self._status_divider)
 
         self._log = QPlainTextEdit()
         self._log.setReadOnly(True)
         self._log.setObjectName("profilingLog")
-        self._log.setFont(QFont("Menlo, Consolas, Courier New", 11))
+        self._log.setFont(self._mono_font())
         self._log.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        root.addWidget(self._log, 1)
+        out_layout.addWidget(self._log, 1)
+
+        root.addWidget(out_box, 1)
 
         # Result bar (hidden until done)
         self._result_bar = QWidget()
@@ -248,15 +245,9 @@ class ClusterProfilingView(QWidget, WorkerMixin):
         # Reset UI
         self._log.clear()
         self._result_bar.setVisible(False)
-        self._overall_bar.setValue(0)
-        self._overall_status.setText("")
-
-        # Clear old pod rows
-        while self._pods_layout.count() > 1:
-            item = self._pods_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self._pod_rows.clear()
+        self._pod_state.clear()
+        self._overall = (0, 0)
+        self._render_status_block()
 
         self._start_btn.setEnabled(False)
         self._cancel_btn.setEnabled(True)
@@ -299,36 +290,35 @@ class ClusterProfilingView(QWidget, WorkerMixin):
         self._log.appendPlainText(line)
         self._log.moveCursor(QTextCursor.MoveOperation.End)
 
+    def _set_pod(self, pod_name: str, pct: int, status: str) -> None:
+        self._pod_state[pod_name] = (pct, status)
+        self._render_status_block()
+
     def _on_pod_started(self, pod_name: str) -> None:
-        if pod_name not in self._pod_rows:
-            row = _PodRow(pod_name)
-            self._pod_rows[pod_name] = row
-            self._pods_layout.insertWidget(self._pods_layout.count() - 1, row)
-        self._pod_rows[pod_name].set_status("Starting…", 10)
+        self._set_pod(pod_name, 10, "Starting…")
 
     def _on_pod_progress(self, pod_name: str, msg: str) -> None:
-        if pod_name in self._pod_rows:
-            self._pod_rows[pod_name].set_status(msg, 50)
+        if pod_name in self._pod_state:
+            self._set_pod(pod_name, 50, msg)
 
     def _on_pod_complete(self, pod_name: str, success: bool) -> None:
-        if pod_name in self._pod_rows:
-            self._pod_rows[pod_name].set_complete(success)
+        self._set_pod(pod_name, 100, "✅ Complete" if success else "❌ Failed")
 
     def _on_pod_error(self, pod_name: str, msg: str) -> None:
-        if pod_name in self._pod_rows:
-            self._pod_rows[pod_name].set_status(f"⚠️ {msg[:40]}", 100)
+        self._set_pod(pod_name, 100, f"⚠️ {msg}")
 
     def _on_overall_progress(self, done: int, total: int) -> None:
-        pct = int(done / total * 100) if total else 0
-        self._overall_bar.setValue(pct)
-        self._overall_status.setText(f"{done} / {total} pods")
+        self._overall = (done, total)
+        self._render_status_block()
 
     def _on_all_complete(self, save_dir: str) -> None:
         self._detach_worker()
         self._final_dir = save_dir
         self._start_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
-        self._overall_bar.setValue(100)
+        done, total = self._overall
+        self._overall = (total or done, total or done)
+        self._render_status_block()
         self._result_label.setText(f"✅ Profiles saved to: {save_dir}")
         self._result_bar.setVisible(True)
 
@@ -337,6 +327,65 @@ class ClusterProfilingView(QWidget, WorkerMixin):
         self._start_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
         self._append_log(f"❌ Fatal error: {msg}")
+
+    # ------------------------------------------------------------------ #
+    # Pinned status block                                                  #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _mono_font() -> QFont:
+        """The one font shared by the status block and the log."""
+        font = QFont("Menlo")
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        font.setFamilies(["Menlo", "Consolas", "Courier New", "monospace"])
+        font.setPointSize(11)
+        return font
+
+    @staticmethod
+    def _text_bar(pct: int) -> str:
+        filled = round(max(0, min(100, pct)) / 100 * _BAR_WIDTH)
+        return f"[{_BAR_FULL * filled}{_BAR_EMPTY * (_BAR_WIDTH - filled)}]"
+
+    def _render_status_block(self) -> None:
+        """
+        Rewrite the pinned block above the log.
+
+        Cheap enough to redo wholesale on every signal — it is a handful of
+        lines — and rewriting avoids having to track per-line cursor positions.
+        """
+        lines: list[str] = []
+        name_width = max((len(n) for n in self._pod_state), default=0)
+        name_width = max(name_width, len("Overall"))
+
+        for pod_name, (pct, status) in self._pod_state.items():
+            lines.append(f"{pod_name:<{name_width}}  {self._text_bar(pct)} {pct:>4}%  {status}")
+
+        done, total = self._overall
+        if total:
+            pct = int(done / total * 100)
+            lines.append(
+                f"{'Overall':<{name_width}}  {self._text_bar(pct)} {pct:>4}%  "
+                f"({done} of {total} pods)"
+            )
+
+        has_content = bool(lines)
+        self._status_block.setVisible(has_content)
+        self._status_divider.setVisible(has_content)
+        if not has_content:
+            self._status_block.clear()
+            return
+
+        self._status_block.setPlainText("\n".join(lines))
+        self._resize_status_block(len(lines))
+
+    def _resize_status_block(self, line_count: int) -> None:
+        """Grow the block to fit its lines so the log keeps the remaining space."""
+        rows = min(line_count, _STATUS_BLOCK_MAX_ROWS)
+        line_height = self._status_block.fontMetrics().lineSpacing()
+        margins = self._status_block.contentsMargins()
+        # 12px = the 6px QSS padding top and bottom; 2px keeps the last line clear.
+        height = rows * line_height + margins.top() + margins.bottom() + 14
+        self._status_block.setFixedHeight(height)
 
     # ------------------------------------------------------------------ #
     # Helpers                                                              #
@@ -353,43 +402,3 @@ class ClusterProfilingView(QWidget, WorkerMixin):
         if not self._final_dir or not os.path.exists(self._final_dir):
             return
         subprocess.Popen(["open", self._final_dir])
-
-
-# ---------------------------------------------------------------------------
-# Pod row widget
-# ---------------------------------------------------------------------------
-
-
-class _PodRow(QWidget):
-    """Compact row showing pod name, progress bar, and status label."""
-
-    def __init__(self, pod_name: str, parent=None) -> None:
-        super().__init__(parent)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
-
-        name_lbl = QLabel(pod_name)
-        name_lbl.setObjectName("infraStatusLabel")
-        name_lbl.setFixedWidth(130)
-        layout.addWidget(name_lbl)
-
-        self._bar = QProgressBar()
-        self._bar.setObjectName("progressBar")
-        self._bar.setRange(0, 100)
-        self._bar.setValue(0)
-        layout.addWidget(self._bar, 1)
-
-        self._status = QLabel("Waiting…")
-        self._status.setObjectName("infraStatusLabel")
-        self._status.setFixedWidth(160)
-        layout.addWidget(self._status)
-
-    def set_status(self, msg: str, pct: int) -> None:
-        self._bar.setValue(pct)
-        self._status.setText(msg[:30])
-
-    def set_complete(self, success: bool) -> None:
-        self._bar.setValue(100)
-        self._status.setText("✅ Complete" if success else "❌ Failed")
-        self._status.setObjectName("stsHealthOk" if success else "stsHealthError")

@@ -46,7 +46,6 @@ INFRA_ACCENT_BLUE_HOVER = "#79c0ff"
 # COLOUR TOKENS — Log Levels
 # ---------------------------------------------------------------------------
 
-COLOR_LEVEL_PANIC_ERROR_BG = "#3d0a0a"
 COLOR_LEVEL_PANIC_ERROR_TEXT = "#ff5555"
 COLOR_LEVEL_WARNING_TEXT = "#F2D53C"
 COLOR_LEVEL_INFO_TEXT = INFRA_ACCENT_BLUE
@@ -605,14 +604,30 @@ QWidget#profilingView {{
     background-color: {INFRA_BG_PRIMARY};
 }}
 
-QPlainTextEdit#profilingLog {{
+/* Capture Output — one bordered panel holding the pinned pod-status block and
+   the scrolling live log. The box owns the border; both text areas inside are
+   borderless and transparent so the two read as a single panel. */
+QWidget#profilingOutputBox {{
     background-color: {INFRA_BG_PRIMARY};
-    color: {INFRA_TEXT_PRIMARY};
     border: 1px solid {INFRA_BORDER};
     border-radius: 4px;
+}}
+
+QPlainTextEdit#profilingStatusBlock,
+QPlainTextEdit#profilingLog {{
+    background-color: transparent;
+    color: {INFRA_TEXT_PRIMARY};
+    border: none;
     font-family: "Menlo", "Consolas", "Courier New", monospace;
     font-size: 12px;
     padding: 6px;
+}}
+
+QFrame#profilingOutputDivider {{
+    background-color: {INFRA_BORDER};
+    border: none;
+    max-height: 1px;
+    min-height: 1px;
 }}
 
 QLabel#profilingFileLink {{
@@ -703,6 +718,18 @@ QLabel#stackState {{
     color: {INFRA_TEXT_MUTED};
     font-style: italic;
     font-size: 12px;
+}}
+
+/* shared/loading_bar.py — blue accent override for infra views. */
+QProgressBar#loadingBar {{
+    max-height: 3px;
+    min-height: 3px;
+    border: none;
+    background-color: {INFRA_BG_PRIMARY};
+}}
+
+QProgressBar#loadingBar::chunk {{
+    background-color: {INFRA_ACCENT_BLUE};
 }}
 
 QProgressBar#progressBar {{
@@ -819,8 +846,42 @@ QLabel#rbacSectionLabel {{
 # Apply INFRA_STYLESHEET to the root infra widget via self.setStyleSheet().
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# QSS — Row detail pane  (LB Traffic / Logs / RBAC Log expandable detail)
+# ---------------------------------------------------------------------------
+
+INFRA_DETAIL_PANE_QSS = f"""
+QWidget#detailPane {{
+    background-color: {INFRA_BG_SECONDARY};
+    border-top: 1px solid {INFRA_BORDER};
+}}
+
+QWidget#detailPaneHeader {{
+    background-color: {INFRA_BG_SECONDARY};
+    border-bottom: 1px solid {INFRA_BORDER};
+}}
+
+QTextEdit#detailPaneBody {{
+    background-color: {INFRA_BG_PRIMARY};
+    color: {INFRA_TEXT_PRIMARY};
+    border: none;
+    padding: 6px 8px;
+}}
+
+"""
+
+# The pane's body is a rich-text document, and a widget stylesheet does not reach
+# inside one — these rules ship as a <style> block in the HTML itself.
+INFRA_DETAIL_HTML_CSS = f"""<style>
+.k {{ color: {INFRA_TEXT_MUTED}; padding-right: 14px; }}
+.v {{ color: {INFRA_TEXT_PRIMARY}; }}
+.sep {{ color: {INFRA_TEXT_MUTED}; font-size: 11px; }}
+.j {{ color: {INFRA_ACCENT_BLUE}; }}
+</style>"""
+
 INFRA_STYLESHEET = (
     INFRA_TABLE_QSS
+    + INFRA_DETAIL_PANE_QSS
     + INFRA_TOOLBAR_QSS
     + INFRA_JSON_DIALOG_QSS
     + INFRA_BADGE_QSS
