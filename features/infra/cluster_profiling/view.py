@@ -8,7 +8,8 @@ Layout
 │ CLUSTER PROFILING                                        │
 │ Cluster: weaviate-abc123                                 │
 ├──────────────────────────────── Settings ────────────────┤
-│ Duration: ◉ 30s  ○ 60s  ○ 120s                          │
+│ Duration (CPU / fgprof): ◉ 30s  ○ 60s  ○ 120s           │
+│ Download timeout: ○ 60s  ○ 300s  ◉ 600s                 │
 │ Save to:  [Choose Folder…]  /Users/x/profiles           │
 │                                                          │
 │ [▶ Start Capture]   [◼ Cancel]                          │
@@ -59,6 +60,7 @@ from PyQt6.QtWidgets import (
 
 from app.state import AppState
 from features.infra.cluster_profiling.worker import ClusterProfilingWorker
+from shared.download_timeout_picker import DownloadTimeoutPicker
 from shared.styles.infra_qss import INFRA_STYLESHEET
 from shared.worker_mixin import WorkerMixin
 
@@ -180,9 +182,9 @@ class ClusterProfilingView(QWidget, WorkerMixin):
 
         # Duration
         dur_row = QHBoxLayout()
-        dur_lbl = QLabel("Duration:")
+        dur_lbl = QLabel("Duration (CPU / fgprof):")
         dur_lbl.setObjectName("infraStatusLabel")
-        dur_lbl.setFixedWidth(70)
+        dur_lbl.setFixedWidth(170)
         dur_row.addWidget(dur_lbl)
         self._dur_group = QButtonGroup(self)
         saved_dur = int(self._settings.value(_SETTINGS_KEY_DUR, 30))
@@ -199,6 +201,10 @@ class ClusterProfilingView(QWidget, WorkerMixin):
         # Ensure one is always selected
         if not self._dur_group.checkedButton() and self._dur_group.buttons():
             self._dur_group.buttons()[0].setChecked(True)
+
+        # Download timeout (instant profiles)
+        self._timeout_picker = DownloadTimeoutPicker(label_width=170)
+        layout.addWidget(self._timeout_picker)
 
         # Save folder
         folder_row = QHBoxLayout()
@@ -240,6 +246,8 @@ class ClusterProfilingView(QWidget, WorkerMixin):
         duration = btn.property("duration_secs") if btn else 30
         self._settings.setValue(_SETTINGS_KEY_DUR, duration)
 
+        timeout_secs = self._timeout_picker.save()
+
         base_dir = self._settings.value(_SETTINGS_KEY_FOLDER, os.path.expanduser("~"))
 
         # Reset UI
@@ -257,6 +265,7 @@ class ClusterProfilingView(QWidget, WorkerMixin):
             duration=duration,
             base_save_dir=base_dir,
             cluster_id=self.cluster_id,
+            download_timeout=timeout_secs,
         )
         self._worker.log_line.connect(self._append_log)
         self._worker.pod_started.connect(self._on_pod_started)
