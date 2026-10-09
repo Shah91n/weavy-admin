@@ -75,6 +75,7 @@ shared/
   worker_mixin.py                Signal connection/disconnection helpers
   detail_pane.py                 RowDetailPane — expandable full-row detail under log tables
   loading_bar.py                 LoadingBar — thin indeterminate strip shown while a worker runs
+  download_timeout_picker.py     DownloadTimeoutPicker — profiling download-timeout radio row
   request_logger.py              HTTP request interceptor (Qt-aware)
   models/
     dynamic_weaviate_model.py    QAbstractTableModel for Weaviate object data

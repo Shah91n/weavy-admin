@@ -148,6 +148,7 @@ class ProfilingCaptureWorker(QThread):
         duration: int,
         save_dir: str,
         profiles: list,
+        download_timeout: int | None = None,
         parent: object | None = None,
     ) -> None:
         super().__init__(parent)
@@ -156,6 +157,7 @@ class ProfilingCaptureWorker(QThread):
         self.duration = duration
         self.save_dir = save_dir
         self.profiles = profiles
+        self.download_timeout = download_timeout
 
     def run(self) -> None:
         pf_proc = None
@@ -175,7 +177,9 @@ class ProfilingCaptureWorker(QThread):
                 pb_path = os.path.join(self.save_dir, f"{profile_name}.pb.gz")
                 self.profile_started.emit(profile_name)
                 self.progress.emit(f"Capturing {profile_name}…")
-                ok = ProfilingBridge.capture_profile(profile_name, self.duration, pb_path)
+                ok = ProfilingBridge.capture_profile(
+                    profile_name, self.duration, pb_path, self.download_timeout
+                )
                 if ok:
                     results[profile_name] = pb_path
                 self.profile_complete.emit(profile_name, pb_path if ok else "", ok)
@@ -183,21 +187,21 @@ class ProfilingCaptureWorker(QThread):
             # ── Step 2: goroutine text dump ─────────────────────────────────
             dump_path = os.path.join(self.save_dir, "goroutine_dump.txt")
             self.progress.emit("Fetching goroutine text dump…")
-            if ProfilingBridge.capture_goroutine_text_dump(dump_path):
+            if ProfilingBridge.capture_goroutine_text_dump(dump_path, self.download_timeout):
                 results["goroutine_dump"] = dump_path
 
             # ── Step 3: cpu, then fgprof (never at the same time) ──────────
             timed = [p for p in self.profiles if p in _TIMED_PROFILES]
             if timed:
-                self.progress.emit(f"Capturing cpu, then fgprof (duration: {self.duration}s each)…")
+                self.progress.emit(
+                    f"Capturing {', then '.join(timed)} (duration: {self.duration}s each)…"
+                )
                 for name in timed:
                     self.profile_started.emit(name)
                 timed_results = ProfilingBridge.capture_timed_profiles_sequential(
-                    self.duration, self.save_dir
+                    self.duration, self.save_dir, timed
                 )
                 for name, (ok, pb_path) in timed_results.items():
-                    if name not in timed:
-                        continue
                     if ok:
                         results[name] = pb_path
                     self.profile_complete.emit(name, pb_path if ok else "", ok)

@@ -17,6 +17,7 @@ wrappers.
 """
 
 import contextlib
+import gzip
 import logging
 import os
 import shutil
@@ -32,6 +33,7 @@ _BASE_URL = f"http://localhost:{_PF_PORT}"
 
 # Per-endpoint timeout (seconds).  CPU / fgprof run for up to duration + 30 s.
 _CURL_OVERHEAD = 30
+# Instant profiles use the caller's download timeout, or this when none is given.
 _QUICK_TIMEOUT = 15
 
 # Endpoints keyed by profile name
@@ -113,6 +115,7 @@ class ProfilingBridge:
         profile_type: str,
         duration: int,
         output_path: str,
+        download_timeout: int | None = None,
     ) -> bool:
         """
         Curl a pprof endpoint and save the ``.pb.gz`` binary to *output_path*.
@@ -126,6 +129,10 @@ class ProfilingBridge:
             Sampling duration in seconds (used for CPU and fgprof only).
         output_path:
             Absolute path for the output ``.pb.gz`` file.
+        download_timeout:
+            Max seconds to download an instant profile (heap, allocs, mutex,
+            goroutine).  ``None`` uses the default (15 s).  Large pods can need
+            minutes for heap / allocs.
 
         Returns
         -------
@@ -140,7 +147,10 @@ class ProfilingBridge:
         endpoint = endpoint_tmpl.format(duration=duration)
         url = _BASE_URL + endpoint
 
-        timeout = duration + _CURL_OVERHEAD if profile_type in _TIMED_PROFILES else _QUICK_TIMEOUT
+        if profile_type in _TIMED_PROFILES:
+            timeout = duration + _CURL_OVERHEAD
+        else:
+            timeout = download_timeout or _QUICK_TIMEOUT
 
         cmd = ["curl", "-s", "--max-time", str(timeout), "-o", output_path, url]
         logger.debug("Capturing %s profile: %s", profile_type, " ".join(cmd))
@@ -153,13 +163,19 @@ class ProfilingBridge:
                     result.returncode,
                     result.stderr.decode(errors="replace"),
                 )
+                _remove_partial(output_path)
                 return False
             if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
                 logger.warning("Output empty for %s: %s", profile_type, output_path)
                 return False
+            if not _is_complete_gzip(output_path):
+                logger.warning("Truncated %s profile: %s", profile_type, output_path)
+                _remove_partial(output_path)
+                return False
             return True
         except subprocess.TimeoutExpired:
             logger.warning("Timeout capturing %s profile", profile_type)
+            _remove_partial(output_path)
             return False
         except FileNotFoundError:
             logger.error("curl not found. Install curl and ensure it is on PATH.")
@@ -169,17 +185,18 @@ class ProfilingBridge:
             return False
 
     @staticmethod
-    def capture_goroutine_text_dump(output_path: str) -> bool:
+    def capture_goroutine_text_dump(output_path: str, download_timeout: int | None = None) -> bool:
         """
         Fetch ``/debug/pprof/goroutine?debug=2`` and save the full text dump.
 
         Returns ``True`` on success.
         """
         url = f"{_BASE_URL}/debug/pprof/goroutine?debug=2"
-        cmd = ["curl", "-s", "--max-time", str(_QUICK_TIMEOUT), "-o", output_path, url]
+        timeout = download_timeout or _QUICK_TIMEOUT
+        cmd = ["curl", "-s", "--max-time", str(timeout), "-o", output_path, url]
         logger.debug("Capturing goroutine text dump")
         try:
-            result = subprocess.run(cmd, capture_output=True, timeout=_QUICK_TIMEOUT + 5)
+            result = subprocess.run(cmd, capture_output=True, timeout=timeout + 5)
             if result.returncode != 0:
                 logger.warning(
                     "curl failed for goroutine text dump (exit %d): %s",
@@ -200,6 +217,7 @@ class ProfilingBridge:
     def capture_timed_profiles_sequential(
         duration: int,
         output_dir: str,
+        profiles: list[str],
     ) -> dict[str, tuple[bool, str]]:
         """
         Capture ``cpu`` and ``fgprof`` one after the other — never at the same
@@ -207,8 +225,9 @@ class ProfilingBridge:
 
         When both profilers run concurrently each one shows up in the other's
         profile, which makes them harder to read.  ``cpu`` is captured first,
-        then ``fgprof``, so each covers its own clean window.  The method
-        therefore blocks for roughly ``2 * duration`` seconds.
+        then ``fgprof``, so each covers its own clean window.  Only the ones in
+        *profiles* run, so the method blocks for ``duration`` seconds per
+        selected profile.
 
         Parameters
         ----------
@@ -216,16 +235,17 @@ class ProfilingBridge:
             Sampling duration in seconds, per profile.
         output_dir:
             Directory where ``.pb.gz`` files are written.
+        profiles:
+            Selected profiles; any of ``"cpu"`` / ``"fgprof"`` in it are run.
 
         Returns
         -------
         dict
-            ``{profile_name: (success, file_path)}`` for ``"cpu"`` and
-            ``"fgprof"``.
+            ``{profile_name: (success, file_path)}`` for each profile run.
         """
         results: dict[str, tuple[bool, str]] = {}
 
-        for name in ("cpu", "fgprof"):
+        for name in [p for p in ("cpu", "fgprof") if p in profiles]:
             output_path = os.path.join(output_dir, f"{name}.pb.gz")
             logger.debug("Sequential capture start: %s (%ds)", name, duration)
             ok = ProfilingBridge.capture_profile(name, duration, output_path)
@@ -277,6 +297,26 @@ class ProfilingBridge:
 # ---------------------------------------------------------------------------
 # Module-level helper
 # ---------------------------------------------------------------------------
+
+
+def _is_complete_gzip(path: str) -> bool:
+    """True when *path* decompresses to the end — i.e. the download was not cut off.
+
+    Streams in chunks so multi-GB heap profiles never sit in memory at once.
+    """
+    try:
+        with gzip.open(path, "rb") as fh:
+            while fh.read(1 << 20):
+                pass
+        return True
+    except (OSError, EOFError):  # BadGzipFile is an OSError
+        return False
+
+
+def _remove_partial(path: str) -> None:
+    """Delete a half-written profile so it is never mistaken for a good one."""
+    with contextlib.suppress(OSError):
+        os.remove(path)
 
 
 def _find_binary(name: str) -> str | None:

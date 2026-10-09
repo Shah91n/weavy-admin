@@ -48,6 +48,7 @@ from features.infra.profiling.worker import (
     ProfilingCaptureWorker,
     ProfilingGoroutineWorker,
 )
+from shared.download_timeout_picker import DownloadTimeoutPicker
 from shared.styles.infra_qss import INFRA_ACCENT_BLUE, INFRA_STYLESHEET
 
 logger = logging.getLogger(__name__)
@@ -347,7 +348,7 @@ class ProfilingView(QWidget):
 
         # Duration
         dur_row = QHBoxLayout()
-        dur_lbl = QLabel("Duration:")
+        dur_lbl = QLabel("Duration (CPU / fgprof):")
         dur_lbl.setObjectName("infraStatusLabel")
         dur_row.addWidget(dur_lbl)
         self._dur_group = QButtonGroup(self)
@@ -360,6 +361,10 @@ class ProfilingView(QWidget):
             dur_row.addWidget(rb)
         dur_row.addStretch()
         layout.addLayout(dur_row)
+
+        # Download timeout (instant profiles)
+        self._timeout_picker = DownloadTimeoutPicker()
+        layout.addWidget(self._timeout_picker)
 
         # Profile checkboxes
         prof_lbl = QLabel("Profiles:")
@@ -700,6 +705,8 @@ class ProfilingView(QWidget):
         btn = self._dur_group.checkedButton()
         duration = btn.property("duration_secs") if btn else 30
 
+        timeout_secs = self._timeout_picker.save()
+
         save_dir = os.path.join(
             self._settings.value(_SETTINGS_KEY_FOLDER, os.path.expanduser("~")),
             f"{self.pod_name}_{int(time.time())}",
@@ -720,6 +727,7 @@ class ProfilingView(QWidget):
             duration=duration,
             save_dir=save_dir,
             profiles=selected,
+            download_timeout=timeout_secs,
         )
         self._capture_worker.progress.connect(self._capture_status_lbl.setText)
         self._capture_worker.profile_started.connect(self._on_profile_started)

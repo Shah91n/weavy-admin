@@ -65,6 +65,7 @@ class ClusterProfilingWorker(QThread):
         base_save_dir: str,
         profiles: list | None = None,
         cluster_id: str = "",
+        download_timeout: int | None = None,
         parent: object | None = None,
     ) -> None:
         super().__init__(parent)
@@ -73,6 +74,7 @@ class ClusterProfilingWorker(QThread):
         self.base_save_dir = base_save_dir
         self.profiles = profiles or _DEFAULT_PROFILES
         self.cluster_id = cluster_id or namespace
+        self.download_timeout = download_timeout
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -161,7 +163,9 @@ class ClusterProfilingWorker(QThread):
                 pb_path = os.path.join(pod_dir, f"{profile_name}.pb.gz")
                 self._log(f"    - {profile_name}…")
                 self.pod_progress.emit(pod_name, f"Capturing {profile_name}…")
-                ok = ProfilingBridge.capture_profile(profile_name, self.duration, pb_path)
+                ok = ProfilingBridge.capture_profile(
+                    profile_name, self.duration, pb_path, self.download_timeout
+                )
                 if ok:
                     size_kb = os.path.getsize(pb_path) // 1024
                     self._log(f"      ✓ {profile_name}.pb.gz  ({size_kb} KB)")
@@ -174,7 +178,7 @@ class ClusterProfilingWorker(QThread):
                 dump_path = os.path.join(pod_dir, "goroutine_dump.txt")
                 self._log("  → 2. Fetching goroutine text dump…")
                 self.pod_progress.emit(pod_name, "Goroutine dump…")
-                ok = ProfilingBridge.capture_goroutine_text_dump(dump_path)
+                ok = ProfilingBridge.capture_goroutine_text_dump(dump_path, self.download_timeout)
                 if ok:
                     size_kb = os.path.getsize(dump_path) // 1024
                     self._log(f"    ✓ goroutine_dump.txt  ({size_kb} KB)")
@@ -184,14 +188,14 @@ class ClusterProfilingWorker(QThread):
             # ── Step 3: cpu, then fgprof (never at the same time) ──────────
             timed = [p for p in self.profiles if p in ("cpu", "fgprof")]
             if timed and not self._cancelled:
-                self._log(f"  → 3. Downloading CPU, then fgprof (duration: {self.duration}s each)…")
-                self.pod_progress.emit(pod_name, f"cpu → fgprof ({self.duration}s each)…")
+                self._log(
+                    f"  → 3. Downloading {', then '.join(timed)} (duration: {self.duration}s each)…"
+                )
+                self.pod_progress.emit(pod_name, f"{' → '.join(timed)} ({self.duration}s each)…")
                 timed_results = ProfilingBridge.capture_timed_profiles_sequential(
-                    self.duration, pod_dir
+                    self.duration, pod_dir, timed
                 )
                 for name, (ok, pb_path) in timed_results.items():
-                    if name not in timed:
-                        continue
                     if ok:
                         size_kb = os.path.getsize(pb_path) // 1024
                         self._log(f"      ✓ {name}.pb.gz  ({size_kb} KB)")
